@@ -1,0 +1,62 @@
+{
+  "database": {
+    "path": "/mnt/raid0/data_erick/kraken_trading_model_v2/data/kraken_v2.db"
+  },
+  "models": {
+    "directory": "/mnt/raid0/data_erick/kraken_trading_model_v2/models/xgboost_regime_specific",
+    "backup_directory": "/mnt/raid0/data_erick/kraken_trading_model_v2/models/backups"
+  },
+  "logging": {
+    "directory": "/mnt/raid0/data_erick/kraken_trading_model_v2/logs",
+    "level": "INFO",
+    "retention_days": 30
+  },
+  "trading": {
+    "pairs": [
+      "XBTUSDT", "ETHUSDT", "SOLUSDT", "ADAUSDT", "DOTUSDT",
+      "LTCUSDT", "XRPUSDT", "LINKUSDT", "AVAXUSDT"
+    ],
+    "regimes": [
+      "bear_high_vol",
+      "bull_high_vol", 
+      "bull_normal_vol",
+      "range_high_vol",
+      "range_normal_vol"
+    ]
+  },
+  "validation": {
+    "min_accuracy": 0.45,
+    "min_trades": 10,
+    "lookback_days": 30
+  },
+  "deployment": {
+    "min_success_rate": 0.70,
+    "enable_rollback": true,
+    "notification_webhook": null
+  },
+  "data_pipeline": {
+    "feature_lag_hours": 2,
+    "max_data_age_hours": 8,
+    "required_data_completeness": 0.95
+  },
+  "notifications": {
+    "email": {
+      "enabled": false,
+      "smtp_server": "",
+      "smtp_port": 587,
+      "username": "",
+      "password": "",
+      "recipients": []
+    },
+    "slack": {
+      "enabled": false,
+      "webhook_url": ""
+    }
+  },
+  "scheduling": {
+    "data_update_interval_hours": 4,
+    "model_retrain_day": "sunday",
+    "model_retrain_hour": 2,
+    "backup_retention_weeks": 4
+  }
+}

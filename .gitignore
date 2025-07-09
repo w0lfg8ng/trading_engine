@@ -1,0 +1,101 @@
+# Virtual Environment
+.venv/
+venv/
+
+# Data Files
+data/raw/*.csv
+data/processed/*.csv
+*.db
+
+# Model Files
+models/*.pkl
+
+# Environment Variables
+.env
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# Logs
+logs/*.log
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# API Keys and Secrets
+.env
+*.env
+config/secrets.json
+config/api_keys.json
+
+# Database files (too large for GitHub)
+data/kraken_v2.db
+data/*.db
+*.sqlite
+*.sqlite3
+
+# Log files (can be huge)
+logs/*.log
+*.log
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# Model files (can be large)
+models/xgboost_regime_specific/*.pkl
+models/backups/
+*.pkl
+*.joblib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Large data files
+data/raw/
+data/processed/
+*.csv
+results/*.png
+results/*.csv
+
+# Backup files
+*~
+*.bak
+*.orig
