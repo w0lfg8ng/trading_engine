@@ -64,10 +64,39 @@ class LiveTradingAnalyzer:
         
         if trades_df.empty:
             print("❌ No trades found in database")
-            return
+            
+            # Check for open positions (MUST be BEFORE return)
+            print("\n🔄 CHECKING OPEN POSITIONS:")
+            cursor = self.conn.cursor()  # ← Use class connection
+            
+            cursor.execute("SELECT * FROM equity ORDER BY timestamp DESC LIMIT 5")
+            recent_equity = cursor.fetchall()
+
+            if recent_equity:
+                print("Recent equity entries found - positions may be open")
+                latest_equity = recent_equity[0]
+                print(f"Latest equity: ${latest_equity[2]:.2f}")
+            else:
+                print("No equity data found")
+
+            # Check signals vs trades
+            cursor.execute("SELECT COUNT(*) FROM signals WHERE acted_upon = 1")
+            acted_signals = cursor.fetchone()[0]
+            cursor.execute("SELECT COUNT(*) FROM trades")
+            completed_trades = cursor.fetchone()[0]
+
+            print(f"Signals acted upon: {acted_signals}")
+            print(f"Completed trades: {completed_trades}")
+            print(f"Open positions: {acted_signals - completed_trades}")
+            
+            return  # ← RETURN GOES AFTER THE DEBUGGING CODE
         
+        # This only runs when trades exist
         print("🚀 LIVE TRADING PERFORMANCE ANALYSIS")
         print("=" * 60)
+        
+        # Basic metrics
+        total_trades = len(trades_df)
         
         # Basic metrics
         total_trades = len(trades_df)

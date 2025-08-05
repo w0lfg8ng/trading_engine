@@ -200,11 +200,84 @@ def setup_database(reset=False):
     conn.commit()
     conn.close()
     logger.info("Database setup complete")
+        
+    # Verify model loading at startup
+    logger.info("🔍 Verifying regime model loading...")
+    models_loaded = 0
+    models_failed = 0
+    
+    for pair_key in PAIRS.keys():
+        for regime in ["range_normal_vol", "range_high_vol", "bull_high_vol", "bear_high_vol"]:
+            try:
+                model, encoder, features = load_regime_model(pair_key, regime)
+                if model is not None:
+                    models_loaded += 1
+                    logger.info(f"✅ Loaded: {pair_key}_{regime}")
+                else:
+                    models_failed += 1
+                    logger.warning(f"❌ Failed: {pair_key}_{regime}")
+            except Exception as e:
+                models_failed += 1
+                logger.error(f"❌ Error loading {pair_key}_{regime}: {e}")
+    
+    logger.info(f"📊 Model Loading Summary: {models_loaded} loaded, {models_failed} failed")
+    
+    if models_failed > models_loaded:
+        logger.critical("🚨 CRITICAL: More models failed than loaded! Check model paths!")
+        return
 
 # === Load API Keys from .env ===
 dotenv.load_dotenv()
 api_key = os.getenv("KRAKEN_API_KEY")
 api_secret = os.getenv("KRAKEN_API_SECRET")
+
+# === SIGNAL QUALITY DIAGNOSTICS ===
+def log_signal_diagnostics():
+    """Log current signal selection statistics for monitoring"""
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Get recent signal statistics (last 100 signals)
+        cursor.execute("""
+            SELECT 
+                AVG(confidence) as avg_conf_all,
+                AVG(risk_score) as avg_risk_all,
+                COUNT(*) as total_signals,
+                SUM(CASE WHEN acted_upon = 1 THEN 1 ELSE 0 END) as acted_upon_count
+            FROM (SELECT * FROM signals ORDER BY timestamp DESC LIMIT 100)
+        """)
+        all_stats = cursor.fetchone()
+        
+        # Get recent acted upon signal statistics
+        cursor.execute("""
+            SELECT 
+                AVG(confidence) as avg_conf_acted,
+                AVG(risk_score) as avg_risk_acted,
+                COUNT(*) as acted_count
+            FROM (SELECT * FROM signals WHERE acted_upon = 1 ORDER BY timestamp DESC LIMIT 20)
+        """)
+        acted_stats = cursor.fetchone()
+        
+        conn.close()
+        
+        if all_stats and acted_stats:
+            logger.info("📊 SIGNAL QUALITY DIAGNOSTICS:")
+            logger.info(f"   Recent 100 signals - Avg Conf: {all_stats[0]:.3f}, Avg Risk: {all_stats[1]:.3f}")
+            logger.info(f"   Recent 20 acted upon - Avg Conf: {acted_stats[0]:.3f}, Avg Risk: {acted_stats[1]:.3f}")
+            logger.info(f"   Conversion Rate: {acted_stats[2]}/{all_stats[2]} = {(acted_stats[2]/all_stats[2])*100:.1f}%")
+            
+            # Alert if acted upon signals have lower confidence than all signals
+            if acted_stats[0] < all_stats[0]:
+                logger.warning("⚠️  ALERT: Acted upon signals have LOWER confidence than average!")
+            else:
+                logger.info("✅ Good: Acted upon signals have higher confidence than average")
+                
+    except Exception as e:
+        logger.error(f"Error in signal diagnostics: {e}")
+
+    # Add diagnostic logging schedule
+    last_diagnostics_time = datetime.utcnow()  
 
 kraken = ccxt.kraken({
     'apiKey': api_key,
@@ -257,11 +330,11 @@ MAX_TOTAL_LEVERAGE = 12  # Maximum portfolio-wide leverage
 TARGET_PORTFOLIO_SHARPE = 2.0  # Target portfolio Sharpe ratio
 
 # Signal quality thresholds
-risk_score_threshold = 0.42  # Increased from 0.35 to be more selective
+risk_score_threshold = 0.60  # Increased from 0.42 to 0.60 (much more selective)
 # Updated constants for better replacement behavior
-MIN_REPLACEMENT_IMPROVEMENT = 1.25  # Increased from 1.10 to 1.25 (25% improvement required)
-MIN_HOLD_TIME_FOR_REPLACEMENT = 30  # Minimum 30 minutes before allowing replacement
-EXCEPTIONAL_SIGNAL_REPLACEMENT_THRESHOLD = 0.95  # Very high confidence needed for quick replacement
+MIN_REPLACEMENT_IMPROVEMENT = 2.0  # Increased from 1.25 t0 2.0 (200% improvement required)
+MIN_HOLD_TIME_FOR_REPLACEMENT = 120  # Increased from 30 to 120 minutes (2 hours minimum)
+EXCEPTIONAL_SIGNAL_REPLACEMENT_THRESHOLD = 0.98  # Increased from 0.95 to 0.98 (nearly perfect signals only)
 EXCEPTIONAL_SIGNAL_THRESHOLD = 0.85  # Threshold for exceptional signals (used in position sizing)
 
 # Pair-specific risk thresholds based on performance
@@ -350,11 +423,11 @@ KRAKEN_MAX_LEVERAGE = {
 
 # === Position Management ===
 max_position_size = 3000
-stop_loss_pct = 0.04  # Reduced from 5% to 4%
-take_profit_pct_first_half = 0.025  # Exit 50% at 2.5% profit
-take_profit_pct_full = 0.05  # Exit remaining at 5% profit
-break_even_profit_pct = 0.02  # Move stop to break-even when profit reaches 2%
-max_holding_minutes = 18 * 60  # Extended from 12 hours to 18 hours
+stop_loss_pct = 0.06  # INCREASED from 4% to 6% - was cutting winners short
+take_profit_pct_first_half = 0.04  # INCREASED from 2.5% to 4% - better risk-reward
+take_profit_pct_full = 0.08  # INCREASED from 5% to 8% - let winners run
+break_even_profit_pct = 0.03  # INCREASED from 2% to 3% - move stop to break-even when profit reaches 3%
+max_holding_minutes = 12 * 60  # REDUCED from 18 hours to 12 hours - was too long
 
 # === Liquidity Management ===
 # Dynamic volume percentage based on pair liquidity
@@ -424,6 +497,11 @@ trading_paused_until = None
 partial_exits = {}  # Track positions with partial exits
 signal_quality_history = deque(maxlen=REPLACEMENT_LOOKBACK_WINDOW)  # Recent signal quality history
 
+# Regime caching to avoid frequent database hits
+regime_cache = {}
+last_regime_update = {}
+REGIME_CACHE_MINUTES = 60  # Update regime every 60 minutes
+
 # Global tracking
 current_day = datetime.utcnow().date()
 cash = initial_capital
@@ -442,6 +520,238 @@ daily_stats = {
 }
 
 # === Helper Functions for Portfolio Management ===
+
+# === LIVE TRADING ORDER MANAGEMENT FUNCTIONS ===
+
+def get_open_orders():
+    """Get all open orders from exchange - LIVE TRADING"""
+    try:
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        open_orders = kraken.fetch_open_orders()
+        return open_orders
+        """
+        
+        # Paper trading: return empty list
+        return []
+        
+    except Exception as e:
+        logger.error(f"Error getting open orders: {e}")
+        return []
+
+def cancel_all_orders():
+    """Cancel all open orders - EMERGENCY FUNCTION"""
+    try:
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        open_orders = kraken.fetch_open_orders()
+        cancelled_count = 0
+        
+        for order in open_orders:
+            try:
+                kraken.cancel_order(order['id'], order['symbol'])
+                cancelled_count += 1
+                logger.info(f"Cancelled order {order['id']}")
+            except Exception as e:
+                logger.error(f"Failed to cancel order {order['id']}: {e}")
+        
+        logger.warning(f"Emergency: Cancelled {cancelled_count} open orders")
+        return cancelled_count
+        """
+        
+        # Paper trading: just log
+        logger.info("Emergency order cancellation (paper trading mode)")
+        return 0
+        
+    except Exception as e:
+        logger.error(f"Error in emergency order cancellation: {e}")
+        return 0
+
+def check_order_status(order_id, symbol):
+    """Check status of a specific order - LIVE TRADING"""
+    try:
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        order_status = kraken.fetch_order(order_id, symbol)
+        return order_status
+        """
+        
+        # Paper trading: return mock status
+        return {'status': 'closed', 'filled': 1.0}
+        
+    except Exception as e:
+        logger.error(f"Error checking order status: {e}")
+        return None
+
+def get_trade_balance(asset="ZUSD"):
+    """Get detailed trade balance including margin info - LIVE TRADING"""
+    try:
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        trade_balance = kraken.fetch_trading_balance({'asset': asset})
+        
+        return {
+            'equivalent_balance': trade_balance.get('eb', 0),  # Combined balance
+            'trade_balance': trade_balance.get('tb', 0),       # Trade balance
+            'margin_amount': trade_balance.get('m', 0),        # Margin amount of open positions
+            'unrealized_pnl': trade_balance.get('n', 0),       # Unrealized PnL
+            'cost_basis': trade_balance.get('c', 0),           # Cost basis of positions
+            'current_valuation': trade_balance.get('v', 0),    # Current valuation
+            'equity': trade_balance.get('e', 0),               # Equity = TB + unrealized PnL
+            'free_margin': trade_balance.get('mf', 0),         # Free margin available
+            'margin_level': trade_balance.get('ml', 0),        # Margin level percentage
+            'unexecuted_value': trade_balance.get('uv', 0)     # Value of unexecuted orders
+        }
+        """
+        
+        # Paper trading: return mock data
+        current_equity = calculate_total_equity()
+        return {
+            'equivalent_balance': current_equity,
+            'trade_balance': current_equity,
+            'margin_amount': 0,
+            'unrealized_pnl': 0,
+            'cost_basis': 0,
+            'current_valuation': current_equity,
+            'equity': current_equity,
+            'free_margin': current_equity,
+            'margin_level': 0 if len(open_positions) == 0 else 100,
+            'unexecuted_value': 0
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting trade balance: {e}")
+        return None
+
+def get_trades_history(count=50, pair=None):
+    """Get recent trades history for performance tracking - LIVE TRADING"""
+    try:
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        params = {'trades': True}  # Include trade details
+        if count:
+            params['count'] = count
+        if pair:
+            params['pair'] = pair
+            
+        trades_history = kraken.fetch_my_trades(symbol=pair, limit=count, params=params)
+        
+        formatted_trades = []
+        for trade in trades_history:
+            formatted_trades.append({
+                'trade_id': trade.get('id'),
+                'order_id': trade.get('order_id'),
+                'symbol': trade.get('symbol'),
+                'side': trade.get('side'),
+                'amount': trade.get('amount'),
+                'price': trade.get('price'),
+                'cost': trade.get('cost'),
+                'fee': trade.get('fee', {}).get('cost', 0),
+                'timestamp': trade.get('timestamp'),
+                'datetime': trade.get('datetime')
+            })
+        
+        return formatted_trades
+        """
+        
+        # Paper trading: return data from our database
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        query = "SELECT * FROM trades WHERE is_paper = 1 ORDER BY timestamp DESC"
+        params = []
+        
+        if count:
+            query += " LIMIT ?"
+            params.append(count)
+            
+        cursor.execute(query, params)
+        trades = cursor.fetchall()
+        conn.close()
+        
+        # Convert to list of dictionaries
+        columns = [description[0] for description in cursor.description]
+        formatted_trades = []
+        for trade in trades:
+            trade_dict = dict(zip(columns, trade))
+            formatted_trades.append(trade_dict)
+        
+        return formatted_trades
+        
+    except Exception as e:
+        logger.error(f"Error getting trades history: {e}")
+        return []
+
+def query_order_info(order_ids):
+    """Query detailed information about specific orders - LIVE TRADING"""
+    try:
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        if isinstance(order_ids, str):
+            order_ids = [order_ids]
+        
+        order_info = {}
+        for order_id in order_ids:
+            try:
+                order_details = kraken.fetch_order(order_id)
+                order_info[order_id] = {
+                    'id': order_details.get('id'),
+                    'symbol': order_details.get('symbol'),
+                    'type': order_details.get('type'),
+                    'side': order_details.get('side'),
+                    'amount': order_details.get('amount'),
+                    'price': order_details.get('price'),
+                    'cost': order_details.get('cost'),
+                    'filled': order_details.get('filled'),
+                    'remaining': order_details.get('remaining'),
+                    'status': order_details.get('status'),
+                    'timestamp': order_details.get('timestamp'),
+                    'fee': order_details.get('fee'),
+                    'trades': order_details.get('trades', [])
+                }
+            except Exception as e:
+                logger.error(f"Error querying order {order_id}: {e}")
+                order_info[order_id] = None
+        
+        return order_info
+        """
+        
+        # Paper trading: return mock data
+        mock_info = {}
+        for order_id in (order_ids if isinstance(order_ids, list) else [order_ids]):
+            mock_info[order_id] = {
+                'id': order_id,
+                'symbol': 'BTC/USDT',
+                'type': 'market',
+                'side': 'buy',
+                'amount': 0.001,
+                'price': 50000,
+                'cost': 50,
+                'filled': 0.001,
+                'remaining': 0,
+                'status': 'closed',
+                'timestamp': datetime.utcnow().timestamp() * 1000,
+                'fee': {'cost': 0.2, 'currency': 'USDT'},
+                'trades': []
+            }
+        
+        return mock_info
+        
+    except Exception as e:
+        logger.error(f"Error querying order info: {e}")
+        return {}
 
 def get_margin_fees_for_pair(pair):
     """Get margin fees for a specific trading pair"""
@@ -543,51 +853,130 @@ def calculate_portfolio_var(positions, price_data, correlations=None):
     
     return np.sqrt(portfolio_var)
 
-def detect_market_regime(df_recent, lookback=VOLATILITY_LOOKBACK_WINDOW):
-    """
-    Detect market regime - SAME AS SUCCESSFUL BACKTEST
-    """
-    if len(df_recent) < TREND_WINDOW_DAYS * 24 * 60:  # Not enough data
-        return "range_normal_vol"  # Default regime
+def get_regime_from_pipeline_data(pair_key):
+    """Get current regime using data from the existing pipeline database"""
+    try:
+        # Map pair keys to table names (matching your institutional tables)
+        pair_mapping = {
+            "btcusdt": "XBTUSDT",
+            "ethusdt": "ETHUSDT", 
+            "solusdt": "SOLUSDT",
+            "xrpusdt": "XRPUSDT",
+            "adausdt": "ADAUSDT",
+            "ltcusdt": "LTCUSDT",
+            "dotusdt": "DOTUSDT",
+            "linkusdt": "LINKUSDT",
+            "avaxusdt": "AVAXUSDT",
+        }
+        
+        table_pair = pair_mapping.get(pair_key, pair_key.upper())
+        table_name = f"features_{table_pair}_1m_institutional"
+        
+        # Connect to your main database (not the live trading DB)
+        pipeline_db_path = "/mnt/raid0/data_erick/kraken_trading_model_v2/data/kraken_v2.db"
+        conn = sqlite3.connect(pipeline_db_path)
+        
+        # Get last 60 days of 1-minute data for proper regime detection
+        required_minutes = TREND_WINDOW_DAYS * 24 * 60  # 60 days * 24 hours * 60 minutes
+        
+        query = f"""
+        SELECT timestamp, open, high, low, close, volume 
+        FROM {table_name} 
+        ORDER BY timestamp DESC 
+        LIMIT {required_minutes}
+        """
+        
+        df = pd.read_sql(query, conn)
+        conn.close()
+        
+        if df.empty:
+            logger.warning(f"No pipeline data found for {pair_key} in table {table_name}")
+            return "range_normal_vol"
+        
+        # Convert timestamp if it's in string format
+        if df['timestamp'].dtype == 'object':
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+            except:
+                # If timestamp is unix, convert from unix
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        
+        # Sort by timestamp (oldest first for regime detection)
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        
+        if len(df) >= VOLATILITY_WINDOW_DAYS * 24 * 60:  # At least 30 days for basic regime detection
+            regime = detect_simplified_regime(df)
+            logger.info(f"Pipeline regime detection for {pair_key}: {regime} (using {len(df)} rows)")
+            return regime
+        else:
+            logger.warning(f"Insufficient pipeline data for {pair_key}: {len(df)} rows, using simplified detection")
+            return detect_simplified_regime(df)
+            
+    except Exception as e:
+        logger.error(f"Error getting regime from pipeline for {pair_key}: {e}")
+        # Fallback to live data with simplified detection
+        try:
+            df = fetch_live_ohlcv(PAIRS[pair_key])
+            if not df.empty:
+                return detect_simplified_regime(df)
+        except:
+            pass
+        return "range_normal_vol"
+
+def detect_simplified_regime(df_recent):
+    """Simplified regime detection when we don't have full 60 days of data"""
+    if len(df_recent) < 1440:  # Less than 1 day
+        return "range_normal_vol"
     
-    df = df_recent.copy()
+    # Use available data for calculations
+    available_days = len(df_recent) / 1440
     
-    # Calculate windows in minutes (assuming 1-minute data)
-    trend_window_minutes = TREND_WINDOW_DAYS * 24 * 60
-    vol_window_minutes = VOLATILITY_WINDOW_DAYS * 24 * 60
+    # Calculate price change over available period  
+    price_change = (df_recent['close'].iloc[-1] / df_recent['close'].iloc[0] - 1)
     
-    # Calculate rolling trend (60-day price change)
-    if len(df) >= trend_window_minutes:
-        price_change_60d = (df['close'].iloc[-1] / df['close'].iloc[-trend_window_minutes] - 1)
-    else:
-        price_change_60d = 0
+    # Annualize the change
+    annualized_change = price_change * (365 / available_days) if available_days > 0 else 0
     
-    # Calculate rolling volatility (30-day)
-    if len(df) >= vol_window_minutes:
-        returns = df['close'].pct_change().dropna()
-        volatility_30d = returns.iloc[-vol_window_minutes:].std() * np.sqrt(1440)  # Daily volatility
-    else:
-        volatility_30d = 0.02  # Default
+    # Calculate volatility over available period
+    returns = df_recent['close'].pct_change().dropna()
+    volatility = returns.std() * np.sqrt(1440)  # Daily volatility
     
-    # Determine trend direction
-    if price_change_60d >= BULL_TREND_THRESHOLD:
+    # Determine trend (using annualized thresholds)
+    if annualized_change >= BULL_TREND_THRESHOLD:
         trend_type = 'bull'
-    elif price_change_60d <= BEAR_TREND_THRESHOLD:
-        trend_type = 'bear'
+    elif annualized_change <= BEAR_TREND_THRESHOLD:
+        trend_type = 'bear'  
     else:
         trend_type = 'range'
     
     # Determine volatility level
-    if volatility_30d >= HIGH_VOLATILITY_THRESHOLD:
+    if volatility >= HIGH_VOLATILITY_THRESHOLD:
         vol_type = 'high_vol'
-    elif volatility_30d <= LOW_VOLATILITY_THRESHOLD:
+    elif volatility <= LOW_VOLATILITY_THRESHOLD:
         vol_type = 'low_vol'
     else:
         vol_type = 'normal_vol'
     
-    # Combine into regime
     regime = f"{trend_type}_{vol_type}"
+    logger.info(f"Simplified regime: {regime} (based on {available_days:.1f} days, vol={volatility:.4f})")
     return regime
+
+def get_cached_regime(pair_key):
+    """Get regime with caching to avoid frequent database hits"""
+    current_time = datetime.utcnow()
+    
+    # Check if we need to update the regime for this pair
+    if (pair_key not in last_regime_update or 
+        (current_time - last_regime_update[pair_key]).total_seconds() > REGIME_CACHE_MINUTES * 60):
+        
+        logger.info(f"Updating cached regime for {pair_key}")
+        regime_cache[pair_key] = get_regime_from_pipeline_data(pair_key)
+        last_regime_update[pair_key] = current_time
+        
+        # Log the regime update
+        logger.info(f"Regime cache updated: {pair_key} -> {regime_cache[pair_key]}")
+    
+    return regime_cache.get(pair_key, "range_normal_vol")
 
 def calculate_risk_adjusted_score(signal, regime):
     """Calculate risk-adjusted score for a signal considering market regime - ENHANCED"""
@@ -596,13 +985,13 @@ def calculate_risk_adjusted_score(signal, regime):
     # Adjust based on market regime
     # Updated regime multipliers to match new regime detection system
     regime_multipliers = {
-        "bull_high_vol": 0.9,       # Bullish but high volatility - slightly cautious
-        "bull_normal_vol": 1.2,     # Ideal trending conditions
-        "bull_low_vol": 1.1,        # Bullish with low volatility
-        "bear_high_vol": 0.7,       # Bearish and volatile - very cautious
-        "bear_normal_vol": 0.8,     # Bearish conditions - cautious
-        "bear_low_vol": 0.9,        # Bearish but stable
-        "range_high_vol": 0.8,      # High volatility sideways - cautious
+        "bull_high_vol": 1.3,       # FIXED: Bull markets should be FAVORABLE, not penalized
+        "bull_normal_vol": 1.4,     # FIXED: Best trending conditions
+        "bull_low_vol": 1.2,        # FIXED: Bullish with low volatility
+        "bear_high_vol": 0.6,       # Bearish and volatile - very cautious
+        "bear_normal_vol": 0.7,     # Bearish conditions - cautious
+        "bear_low_vol": 0.8,        # Bearish but stable
+        "range_high_vol": 0.7,      # High volatility sideways - cautious
         "range_normal_vol": 1.0,    # Normal sideways market
         "range_low_vol": 1.1,       # Low volatility range - slightly favorable
         # Fallback for old regime names
@@ -783,7 +1172,7 @@ def should_replace_position(new_signal, open_positions, price_data):
         return None
     
     # Calculate new signal quality
-    regime = detect_market_regime(price_data.get(new_signal["pair"], pd.DataFrame()))
+    regime = get_cached_regime(new_signal["pair"])
     new_signal_quality = calculate_risk_adjusted_score(new_signal, regime)
     
     # Don't replace positions unless the new signal is exceptional
@@ -818,16 +1207,22 @@ def should_replace_position(new_signal, open_positions, price_data):
             else:
                 current_pnl_pct = (entry_price - current_price) / entry_price
             
-            # Don't replace winning positions unless signal is exceptional
-            if current_pnl_pct > 0.01:  # Position is winning more than 1%
-                if new_signal["confidence"] < 0.9:  # Not exceptional signal
-                    continue  # Skip this position - don't replace winning positions
+            # CRITICAL FIX: Strongly protect winning positions
+            if current_pnl_pct > 0.005:  # Position is winning more than 0.5%
+                if new_signal["confidence"] < 0.95:  # Not exceptional signal
+                    continue  # Skip this position - don't replace ANY winning positions
+                # Even for exceptional signals, require massive improvement for winning positions
+                required_improvement = MIN_REPLACEMENT_IMPROVEMENT * 3.0  # 6x improvement needed
                 
         except Exception as e:
             logger.warning(f"Could not calculate PnL for {pair}: {e}")
             current_pnl_pct = 0
         
-        # Don't replace positions that are too new (unless exceptional signal)
+        # ABSOLUTE PROTECTION: Never replace positions less than 1 hour old
+        if held_minutes < 60:  # Absolute minimum 1 hour
+            continue  # Never replace young positions regardless of signal quality
+        
+        # Additional protection for positions less than 2 hours old
         if held_minutes < MIN_HOLD_TIME_FOR_REPLACEMENT:
             if new_signal["confidence"] < EXCEPTIONAL_SIGNAL_REPLACEMENT_THRESHOLD:
                 continue  # Skip this position for replacement
@@ -933,8 +1328,8 @@ def load_regime_model(pair, regime):
         "adausdt": "ADAUSDT",
         "ltcusdt": "LTCUSDT",
         "dotusdt": "DOTUSDT",
-        "xmrusdt": "XMRUSDT",
-        "dogeusdt": "DOGEUSDT"
+        "linkusdt": "LINKUSDT",    # THIS WAS MISSING!
+        "avaxusdt": "AVAXUSDT",   # THIS WAS MISSING!
     }
     
     model_pair = pair_mapping.get(pair, pair.upper())
@@ -1206,7 +1601,8 @@ def update_price_data(pair_key, df):
     volatility = returns.std() * np.sqrt(1440)  # Convert to daily volatility
     
     # Detect market regime
-    market_regime = detect_market_regime(recent_df)
+    # Use the same regime system as trading decisions
+    market_regime = get_cached_regime(pair_key)
     
     # Store data
     price_data[pair_key] = {
@@ -1264,7 +1660,7 @@ def generate_trading_signal(pair_key, symbol):
             features["future_return"] = 0  # Dummy value
         
         # Detect current market regime FIRST
-        market_regime = detect_market_regime(df)
+        market_regime = get_cached_regime(pair_key)
 
         # Load regime-specific model
         regime_model, regime_encoder, regime_features = load_regime_model(pair_key, market_regime)
@@ -1284,11 +1680,19 @@ def generate_trading_signal(pair_key, symbol):
         # Use regime-specific model
         try:
             # Prepare features for regime model
+            # Prepare features for regime model
             available_features = [col for col in regime_features if col in features.columns]
-    
+            missing_features = [col for col in regime_features if col not in features.columns]
+
             if len(available_features) < len(regime_features) * 0.8:
-                logger.warning(f"Missing too many features for regime {market_regime}, skipping signal")
+                logger.warning(f"Missing too many features for {pair_key} regime {market_regime}")
+                logger.warning(f"Available: {len(available_features)}/{len(regime_features)}")
+                logger.warning(f"Missing features: {missing_features[:10]}...")  # Show first 10
                 return None
+        
+            # Log successful feature matching (only occasionally to avoid spam)
+            if random.random() < 0.01:  # 1% of the time
+                logger.info(f"✅ Feature match for {pair_key}: {len(available_features)}/{len(regime_features)} features available")
     
             # Clean data for prediction
             prediction_data = features[available_features].copy()
@@ -1307,6 +1711,13 @@ def generate_trading_signal(pair_key, symbol):
             prediction = regime_encoder.inverse_transform(regime_predictions)[0]
     
             logger.info(f"Using regime model {pair_key}-{market_regime} with confidence {confidence:.3f}")
+        
+            # Debug signal quality (only log occasionally to avoid spam)
+            if random.random() < 0.1:  # 10% of the time
+                logger.info(f"🔍 Signal Debug for {pair_key}:")
+                logger.info(f"   Prediction: {prediction}, Confidence: {confidence:.3f}")
+                logger.info(f"   Market Regime: {market_regime}")
+                logger.info(f"   Model Features Used: {len(available_features)}")
     
         except Exception as e:
             logger.error(f"Error using regime model: {e}")
@@ -1366,7 +1777,8 @@ def generate_trading_signal(pair_key, symbol):
         score += time_boost
         
         # Get current market regime
-        market_regime = price_data.get(pair_key, {}).get("market_regime", "normal")
+        # Use the regime that was already correctly detected above - don't overwrite it
+        # market_regime is already set from get_cached_regime(pair_key)
         
         # Create features dict for signal
         signal_features = {
@@ -1416,7 +1828,18 @@ def generate_trading_signal(pair_key, symbol):
         pair_threshold = pair_risk_thresholds.get(pair_key, risk_score_threshold)
         
         # Check if signal meets threshold criteria
-        if score >= pair_threshold and prediction in ["buy", "sell"]:
+        # Check if signal meets threshold criteria - FIXED LOGIC
+        pair_threshold = pair_risk_thresholds.get(pair_key, risk_score_threshold)
+
+        # DEBUG: Log threshold comparison
+        if random.random() < 0.1:  # Log 10% of the time to avoid spam
+            logger.info(f"🔍 Signal Threshold Check for {pair_key}:")
+            logger.info(f"   Score: {score:.3f}, Threshold: {pair_threshold:.3f}")
+            logger.info(f"   Confidence: {confidence:.3f}")
+            logger.info(f"   Prediction: {prediction}")
+
+        # FIXED: Use confidence for primary filtering, score as secondary
+        if confidence >= 0.6 and score >= pair_threshold and prediction in ["buy", "sell"]:
             # Create and return trading signal object
             signal = {
                 "pair": pair_key,
@@ -1429,14 +1852,20 @@ def generate_trading_signal(pair_key, symbol):
                 "features": signal_features,
                 "market_regime": market_regime
             }
-            
+    
             # Store signal quality for comparisons later
             signal_quality_history.append((pair_key, calculate_risk_adjusted_score(signal, market_regime)))
-            
+    
+            logger.info(f"✅ SIGNAL GENERATED: {pair_key} {prediction.upper()} | Conf: {confidence:.3f} | Score: {score:.3f}")
+    
             return signal
+        else:
+            # Log why signal was rejected
+            if random.random() < 0.05:  # Log 5% of rejections
+                logger.info(f"❌ Signal rejected for {pair_key}: Conf={confidence:.3f}, Score={score:.3f}, Pred={prediction}")
         
         return None
-    
+        
     except Exception as e:
         logger.error(f"Error generating signal for {pair_key}: {e}")
         logger.error(traceback.format_exc())
@@ -1444,9 +1873,103 @@ def generate_trading_signal(pair_key, symbol):
 
 # === Position Management Functions ===
 
+def emergency_shutdown():
+    """Emergency shutdown - close all positions and cancel all orders"""
+    global trading_paused_until
+    
+    logger.critical("🚨 EMERGENCY SHUTDOWN TRIGGERED 🚨")
+    
+    try:
+        # Cancel all open orders first
+        cancelled_orders = cancel_all_orders()
+        
+        # Close all open positions
+        closed_positions = 0
+        for pair_key in list(open_positions.keys()):
+            if open_positions[pair_key]:
+                success = force_close_position(pair_key, "emergency_shutdown")
+                if success:
+                    closed_positions += 1
+        
+        # Pause trading indefinitely
+        trading_paused_until = datetime.utcnow() + timedelta(hours=24)
+        
+        logger.critical(f"Emergency shutdown complete: {cancelled_orders} orders cancelled, {closed_positions} positions closed")
+        
+        # Send alert (you could add email/SMS notification here)
+        
+    except Exception as e:
+        logger.critical(f"Error during emergency shutdown: {e}")
+
+def check_emergency_signals():
+    """Check for emergency shutdown signals from dashboard"""
+    # Check for signal file
+    if os.path.exists("EMERGENCY_STOP.signal"):
+        logger.critical("🚨 EMERGENCY STOP signal detected from dashboard!")
+        try:
+            os.remove("EMERGENCY_STOP.signal")
+        except:
+            pass
+        return True
+    
+    # Check database for emergency flags
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) FROM circuit_breakers 
+            WHERE type = 'emergency_shutdown' AND is_active = 1
+        """)
+        emergency_count = cursor.fetchone()[0]
+        conn.close()
+        
+        if emergency_count > 0:
+            logger.critical("🚨 EMERGENCY STOP signal detected in database!")
+            return True
+    except Exception as e:
+        logger.error(f"Error checking emergency signals: {e}")
+    
+    return False
+
+def check_performance_circuit_breaker():
+    """Emergency brake if win rate on replaced trades is too low"""
+    global trading_paused_until
+    
+    # Check recent replaced trade performance
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Get last 10 replaced trades
+    cursor.execute("""
+        SELECT COUNT(*), SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END)
+        FROM trades 
+        WHERE exit_reason = 'replaced' 
+        ORDER BY timestamp DESC 
+        LIMIT 10
+    """)
+    
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result and result[0] >= 5:  # At least 5 recent replaced trades
+        total_replaced = result[0]
+        winning_replaced = result[1] or 0
+        replaced_win_rate = winning_replaced / total_replaced
+        
+        # If win rate on replaced trades is below 20%, pause trading
+        if replaced_win_rate < 0.20:
+            trading_paused_until = datetime.utcnow() + timedelta(hours=2)
+            logger.critical(f"🚨 PERFORMANCE CIRCUIT BREAKER: Replaced trade win rate {replaced_win_rate*100:.1f}% too low. Pausing for 2 hours.")
+            return True
+    
+    return False
+
 def check_circuit_breakers():
     """Check if any circuit breakers should be activated - FIXED VERSION"""
     global trading_paused_until, active_circuit_breakers, daily_stats
+    # Check performance-based circuit breaker first
+    if check_performance_circuit_breaker():
+        return True
     
     current_time = datetime.utcnow()
     
@@ -1752,7 +2275,7 @@ def check_exit_conditions():
                     partial_gross_pnl = 0
     
                 # Cap PnL at a reasonable multiple of position value to prevent cascading issues
-                max_reasonable_pnl = partial_position_value * leverage * 0.10  # Max 10% return per trade
+                max_reasonable_pnl = partial_position_value * leverage * 0.05  # REDUCED from 0.10 to 0.05 (max 5% return per trade)
                 if abs(partial_gross_pnl) > max_reasonable_pnl:
                     logger.warning(f"Partial PnL {partial_gross_pnl} exceeds reasonable limit. Capping at {max_reasonable_pnl}")
                     partial_gross_pnl = np.sign(partial_gross_pnl) * max_reasonable_pnl
@@ -1882,7 +2405,7 @@ def check_exit_conditions():
                     gross_pnl = 0
 
                 # Cap PnL at a reasonable multiple of position value to prevent cascading issues
-                max_reasonable_pnl = position_value * leverage * 0.10  # Max 10% return per trade
+                max_reasonable_pnl = position_value * leverage * 0.05  # REDUCED from 0.10 to 0.05 (max 5% return per trade)
                 if abs(gross_pnl) > max_reasonable_pnl:
                     logger.warning(f"PnL {gross_pnl} exceeds reasonable limit. Capping at {max_reasonable_pnl}")
                     gross_pnl = np.sign(gross_pnl) * max_reasonable_pnl
@@ -2142,18 +2665,11 @@ def enter_position(signal):
         return False
     
     # Check if we need to replace an existing position
+    # DISABLED: Position replacement (was causing 0% win rate)
     if len(open_positions) >= max_concurrent_trades:
-        position_to_replace = should_replace_position(signal, open_positions, price_data)
-        
-        if position_to_replace:
-            # Close the position first
-            success = force_close_position(position_to_replace, "replaced")
-            if not success:
-                logger.error(f"Failed to close position {position_to_replace} for replacement")
-                return False
-        else:
-            logger.info(f"Skipping {side} signal for {pair_key}: maximum positions reached")
-            return False
+        logger.info(f"Skipping {side} signal for {pair_key}: maximum positions reached ({len(open_positions)}/{max_concurrent_trades})")
+        logger.info(f"✋ Position replacement DISABLED - was causing losses (0% win rate)")
+        return False
     
     # Calculate position sizing
     recent_volatility = price_data.get(pair_key, {}).get("volatility", 0.02)
@@ -2181,10 +2697,44 @@ def enter_position(signal):
     quantity = position_value / execution_price
     
     try:
-        # === PAPER TRADING EXECUTION ===
-        # For live trading, uncomment the actual kraken order execution
-        
-        # MARGIN TRADING: Only deduct margin fee from cash (not full position value)
+        # === LIVE TRADING EXECUTION ===
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING - REPLACE PAPER TRADING SECTION
+        # ===============================================
+        """
+        # Place actual order on Kraken
+        order_params = {
+            'symbol': symbol,
+            'type': 'market',  # or 'limit' if you want to specify price
+            'side': side,
+            'amount': quantity,
+            'params': {
+                'leverage': leverage,
+                'margin': True  # Enable margin trading
+            }
+        }
+    
+        # Execute the order
+        if side == "buy":
+            order_result = kraken.create_market_buy_order(
+                symbol=symbol,
+                amount=quantity,
+                params={'leverage': leverage, 'margin': True}
+            )
+        else:
+            order_result = kraken.create_market_sell_order(
+                symbol=symbol,
+                amount=quantity,
+                params={'leverage': leverage, 'margin': True}
+            )
+    
+        logger.info(f"Order executed: {order_result}")
+        execution_price = order_result.get('average', price)  # Use actual fill price
+        """
+    
+        # PAPER TRADING EXECUTION (current mode)
+        execution_price = price * (1 + slippage_per_pair[pair_key]) if side == "buy" else price * (1 - slippage_per_pair[pair_key])
+    
         # MARGIN TRADING: Only deduct margin fee from cash (not full position value)
         margin_rates = get_margin_fees_for_pair(pair_key)
         margin_fee = position_value * margin_rates["open_fee"]
@@ -2192,30 +2742,39 @@ def enter_position(signal):
         # Note: In margin trading, we don't deduct the full position_value from cash
         
         # Create position record
-        open_positions[pair_key] = {
-            "entry_time": datetime.utcnow(),
+        position_data = {
+            "pair": pair_key,
+            "symbol": symbol,
+            "side": side,
             "entry_price": execution_price,
             "position_value": position_value,
-            "quantity": quantity,
-            "side": side,
             "leverage": leverage,
+            "quantity": quantity,
+            "entry_time": datetime.utcnow(),
             "confidence": confidence,
-            "score": score, 
-            "highest_price": execution_price,
-            "lowest_price": execution_price,
+            "score": score,
             "features": features,
             "market_regime": market_regime,
             "risk_tier": risk_tier,
+            "highest_price": execution_price if side == "buy" else execution_price,
+            "lowest_price": execution_price if side == "sell" else execution_price,
             "recent_returns": [],
             "last_price": execution_price
         }
         
-        logger.info(f"{pair_key} | 📈 OPENED {side.upper()} @ {execution_price:.4f} | " 
-                  f"Conf: {confidence:.2f} | Score: {score:.2f} | "
-                  f"Size: ${position_value:.2f} | Lev: {leverage}x | Tier: {risk_tier}")
+        # Add to open positions
+        open_positions[pair_key] = position_data
+        
+        # Update daily stats
+        daily_stats["current_capital"] = cash
+        
+        logger.info(f"{pair_key} | 📈 OPENED {side.upper()} @ {execution_price:.4f} | "
+                   f"Size: ${position_value:.2f} | Leverage: {leverage}x | "
+                   f"Confidence: {confidence:.3f} | Score: {score:.3f} | "
+                   f"Regime: {market_regime} | Tier: {risk_tier}")
         
         return True
-    
+        
     except Exception as e:
         logger.error(f"Error entering position for {pair_key}: {e}")
         logger.error(traceback.format_exc())
@@ -2262,6 +2821,32 @@ def force_close_position(pair_key, exit_reason):
         # Calculate gross and net PnL
         gross_pnl = position_value * pnl_pct * leverage
         net_pnl = gross_pnl - total_fees
+        
+        # === LIVE TRADING ORDER EXECUTION ===
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        # Execute the exit order
+        if side == "buy":
+            close_order = kraken.create_market_sell_order(
+                symbol=symbol,
+                amount=quantity,
+                params={'reduce_only': True}  # Only close position, don't open opposite
+            )
+        else:
+            close_order = kraken.create_market_buy_order(
+                symbol=symbol,
+                amount=quantity,
+                params={'reduce_only': True}
+            )
+        
+        logger.info(f"Exit order executed: {close_order}")
+        actual_exit_price = close_order.get('average', exit_price)
+        exit_price = actual_exit_price  # Use actual fill price
+        """
+        
+        # Paper trading continues with simulated exit_price
         
         # Update cash (margin trading: return margin fee + PnL)
         # Return margin using realistic fee structure
@@ -2318,102 +2903,92 @@ def force_close_position(pair_key, exit_reason):
         logger.error(f"Error force closing position {pair_key}: {e}")
         return False
 
-def check_exit_conditions():
-    """Check exit conditions for all open positions - IMPROVED VERSION"""
-    global cash, open_positions, daily_stats, partial_exits
+def sync_positions_with_exchange():
+    """Sync our tracked positions with actual exchange positions - ENHANCED LIVE TRADING"""
+    global open_positions, cash
     
-    current_time = datetime.utcnow()
-    
-    for pair_key in list(open_positions.keys()):
-        position = open_positions[pair_key]
+    try:
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        # Get actual open positions from Kraken
+        actual_positions = kraken.fetch_positions()
         
-        if not position:
-            continue
+        # Get trade balance for additional margin info
+        trade_balance = get_trade_balance()
+        if trade_balance:
+            logger.info(f"Margin Status - Free: ${trade_balance['free_margin']:.2f}, "
+                       f"Used: ${trade_balance['margin_amount']:.2f}, "
+                       f"Level: {trade_balance['margin_level']:.1f}%")
         
-        try:
-            # Get current price
-            symbol = PAIRS[pair_key]
-            ticker = kraken.fetch_ticker(symbol)
-            current_price = ticker['last']
-            
-            # Update position tracking
-            position["last_price"] = current_price
-            
-            # Calculate metrics
-            entry_price = position["entry_price"]
-            entry_time = position["entry_time"]
-            side = position["side"]
-            leverage = position["leverage"]
-            position_value = position["position_value"]
-            held_minutes = (current_time - entry_time).total_seconds() / 60
-            
-            # Apply slippage for exit
-            exit_price = current_price * (1 - slippage_per_pair[pair_key]) if side == "buy" else current_price * (1 + slippage_per_pair[pair_key])
-            
-            # Calculate current PnL
-            if side == "buy":
-                pnl_pct = (exit_price - entry_price) / entry_price
-                # Update trailing high
-                position["highest_price"] = max(position.get("highest_price", entry_price), exit_price)
-                drawdown = (exit_price - position["highest_price"]) / position["highest_price"]
-            else:
-                pnl_pct = (entry_price - exit_price) / entry_price
-                # Update trailing low
-                position["lowest_price"] = min(position.get("lowest_price", entry_price), exit_price)
-                drawdown = (position["lowest_price"] - exit_price) / position["lowest_price"]
-            
-            # Update recent returns
-            if "recent_returns" not in position:
-                position["recent_returns"] = []
-            
-            last_price = position.get("last_price_for_returns", entry_price)
-            if current_price != last_price:
-                if side == "buy":
-                    return_pct = (current_price - last_price) / last_price
-                else:
-                    return_pct = (last_price - current_price) / last_price
+        # Cross-reference with our tracked positions
+        exchange_pairs = set()
+        exchange_position_data = {}
+        
+        for pos in actual_positions:
+            if pos.get('contracts', 0) > 0:  # Has open position
+                symbol = pos['symbol']
+                # Convert symbol back to our pair format
+                pair_key = None
+                for k, v in PAIRS.items():
+                    if v == symbol:
+                        pair_key = k
+                        break
                 
-                position["recent_returns"].append(return_pct)
-                if len(position["recent_returns"]) > 20:
-                    position["recent_returns"].pop(0)
-                
-                position["last_price_for_returns"] = current_price
+                if pair_key:
+                    exchange_pairs.add(pair_key)
+                    exchange_position_data[pair_key] = {
+                        'size': pos.get('contracts', 0),
+                        'side': pos.get('side'),
+                        'entry_price': pos.get('entryPrice', 0),
+                        'mark_price': pos.get('markPrice', 0),
+                        'unrealized_pnl': pos.get('unrealizedPnl', 0),
+                        'margin_used': pos.get('initialMargin', 0)
+                    }
+                    
+                    # Check if we're tracking this position
+                    if pair_key not in open_positions or not open_positions[pair_key]:
+                        logger.warning(f"Found untracked position on exchange: {pair_key}")
+                        logger.info(f"Exchange position: {pos}")
+                        # Could add logic here to import the position into tracking
+        
+        # Check for positions we're tracking but don't exist on exchange
+        tracked_pairs = set(pair for pair, pos in open_positions.items() if pos)
+        missing_on_exchange = tracked_pairs - exchange_pairs
+        
+        for pair_key in missing_on_exchange:
+            logger.warning(f"Tracked position {pair_key} not found on exchange - may have been closed externally")
+            # Mark for investigation but don't auto-close tracked positions
             
-            # Check exit conditions
-            has_partial_exit = pair_key in partial_exits
-            adjusted_stop_loss = get_adjusted_stop_loss(stop_loss_pct, held_minutes)
-            reached_break_even = pnl_pct >= break_even_profit_pct
+        # Log position comparison
+        if exchange_pairs or tracked_pairs:
+            logger.info(f"Position Sync - Exchange: {len(exchange_pairs)}, Tracked: {len(tracked_pairs)}")
             
-            effective_stop_loss = adjusted_stop_loss
-            if reached_break_even:
-                effective_stop_loss = -0.001  # Move to break-even
-            
-            # Exit condition checks
-            should_exit_full = False
-            should_exit_partial = False
-            exit_reason = ""
-            
-            if abs(drawdown) >= effective_stop_loss:
-                should_exit_full = True
-                exit_reason = "stop_loss"
-            elif not has_partial_exit and pnl_pct >= take_profit_pct_first_half:
-                should_exit_partial = True
-                exit_reason = "partial_take_profit"
-            elif has_partial_exit and pnl_pct >= take_profit_pct_full:
-                should_exit_full = True
-                exit_reason = "take_profit"
-            elif held_minutes >= max_holding_minutes:
-                should_exit_full = True
-                exit_reason = "time_limit"
-            
-            # Execute exits
-            if should_exit_partial:
-                execute_partial_exit(pair_key, position, exit_price, current_time)
-            elif should_exit_full:
-                force_close_position(pair_key, exit_reason)
-                
-        except Exception as e:
-            logger.error(f"Error checking exit conditions for {pair_key}: {e}")
+        return exchange_position_data
+        """
+        
+        # For paper trading, just log that sync would happen
+        logger.info(f"Position sync with exchange (paper trading mode) - Tracked positions: {len([p for p in open_positions.values() if p])}")
+        
+        # Return mock exchange data for paper trading
+        mock_exchange_data = {}
+        for pair_key, position in open_positions.items():
+            if position:
+                mock_exchange_data[pair_key] = {
+                    'size': position.get('quantity', 0),
+                    'side': position.get('side'),
+                    'entry_price': position.get('entry_price', 0),
+                    'mark_price': position.get('entry_price', 0),  # Use entry price as mock
+                    'unrealized_pnl': 0,
+                    'margin_used': position.get('position_value', 0) * 0.1  # Mock 10% margin
+                }
+        
+        return mock_exchange_data
+        
+    except Exception as e:
+        logger.error(f"Error syncing positions with exchange: {e}")
+        return {}
 
 def execute_partial_exit(pair_key, position, exit_price, current_time):
     """Execute a partial exit (50% of position)"""
@@ -2499,52 +3074,73 @@ def execute_partial_exit(pair_key, position, exit_price, current_time):
 
 # Make sure this function adds position values:
 def calculate_total_equity():
-    """Calculate total equity including cash and open positions with unrealized PnL"""
+    """Calculate total equity including cash and open positions with unrealized PnL - LIVE VERSION"""
     global cash, open_positions
     
-    # Start with cash
-    total = cash
-    
-    # Add position values AND unrealized PnL for each position
-    for pair_key, position in open_positions.items():
-        if not position:
-            continue
-            
-        try:
-            # Get current price
-            symbol = PAIRS[pair_key]
-            ticker = kraken.fetch_ticker(symbol)
-            current_price = ticker['last']
-            
-            # Calculate position metrics
-            entry_price = position["entry_price"]
-            side = position["side"]
-            leverage = position["leverage"]
-            position_value = position["position_value"]
-            
-            # Calculate position size (quantity)
-            position_size = position_value / entry_price
-            
-            # Calculate current market value of the position
-            current_market_value = position_size * current_price
-            
-            # Calculate PnL
-            if side == "buy":
-                # For long positions: current value - initial investment
-                unrealized_pnl = (current_market_value - position_value) * leverage
-            else:  # sell/short
-                # For short positions: initial investment - current value  
-                unrealized_pnl = (position_value - current_market_value) * leverage
-            
-            # Add unrealized PnL only (in margin trading, position_value is notional)
-            total += unrealized_pnl
-            
-        except Exception as e:
-            logger.error(f"Error calculating equity for {pair_key}: {e}")
-            # If we can't get current price, just add the position value
-            total += position.get("position_value", 0)
-    
-    return total
+    try:
+        # For live trading: Get actual account balance from Kraken
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        balance_response = kraken.fetch_balance()
+        actual_cash = balance_response.get('ZUSD', {}).get('free', cash)
+        
+        # Update our tracked cash with actual balance (with safety check)
+        if abs(actual_cash - cash) > initial_capital * 0.1:  # More than 10% difference
+            logger.warning(f"Large cash discrepancy detected. Tracked: ${cash:.2f}, Actual: ${actual_cash:.2f}")
+        
+        cash = actual_cash
+        """
+        
+        # Start with cash (paper trading version - replace with above for live)
+        total = cash
+        
+        # Add position values AND unrealized PnL for each position
+        for pair_key, position in open_positions.items():
+            if not position:
+                continue
+                
+            try:
+                # Get current price
+                symbol = PAIRS[pair_key]
+                ticker = kraken.fetch_ticker(symbol)
+                current_price = ticker['last']
+                
+                # Calculate position metrics
+                entry_price = position["entry_price"]
+                side = position["side"]
+                leverage = position["leverage"]
+                position_value = position["position_value"]
+                
+                # Calculate position size (quantity)
+                position_size = position_value / entry_price
+                
+                # Calculate current market value of the position
+                current_market_value = position_size * current_price
+                
+                # Calculate PnL
+                if side == "buy":
+                    # For long positions: current value - initial investment
+                    unrealized_pnl = (current_market_value - position_value) * leverage
+                else:  # sell/short
+                    # For short positions: initial investment - current value  
+                    unrealized_pnl = (position_value - current_market_value) * leverage
+                
+                # Add unrealized PnL only (in margin trading, position_value is notional)
+                total += unrealized_pnl
+                
+            except Exception as e:
+                logger.error(f"Error calculating equity for {pair_key}: {e}")
+                # If we can't get current price, just add the position value
+                total += position.get("position_value", 0)
+        
+        return total
+        
+    except Exception as e:
+        logger.error(f"Error in calculate_total_equity: {e}")
+        # Fallback to cash + position values
+        return cash + sum(pos.get("position_value", 0) for pos in open_positions.values() if pos)
 
 def reconcile_equity():
     """Reconcile equity calculations to prevent drift - ENHANCED VERSION"""
@@ -2732,25 +3328,114 @@ def queue_signal(signal):
     logger.info(f"Queued {signal['side']} signal for {pair_key} with {delay_minutes}m delay (execute at {execute_time})")
 
 def process_signal_queues():
-    """Process all queued signals that are ready to execute"""
+    """Process all queued signals that are ready to execute - IMPROVED: Best quality first"""
     global signal_queues
     
     current_time = datetime.utcnow()
     
-    # Process each pair's queue
+    # Skip if trading is paused
+    if trading_paused_until and current_time < trading_paused_until:
+        return
+    
+    # Collect all ready signals from all pairs
+    ready_signals = []
+    
     for pair_key in list(signal_queues.keys()):
-        # Skip if trading is paused
-        if trading_paused_until and current_time < trading_paused_until:
-            continue
-            
-        # Process signals ready for execution
         queue = signal_queues[pair_key]
-        while queue and queue[0]["execute_time"] <= current_time:
-            # Get the next signal
-            next_signal = queue.popleft()["signal"]
+        
+        # Collect signals that are ready to execute
+        signals_to_remove = []
+        for i, signal_data in enumerate(queue):
+            if signal_data["execute_time"] <= current_time:
+                signal = signal_data["signal"]
+                # Calculate signal quality for sorting
+                regime = get_cached_regime(signal["pair"])
+                quality = calculate_risk_adjusted_score(signal, regime)
+                ready_signals.append((quality, signal))
+                signals_to_remove.append(i)
+        
+        # Remove processed signals from queue (in reverse order to maintain indices)
+        for i in reversed(signals_to_remove):
+            del queue[i]
+    
+    # Sort by quality (highest first) - THIS IS THE KEY FIX
+    ready_signals.sort(reverse=True, key=lambda x: x[0])
+    
+    # Process best signals first until positions are full
+    for quality, signal in ready_signals:
+        if len(open_positions) >= max_concurrent_trades:
+            break  # Stop when positions are full
+        
+        logger.info(f"Processing signal with quality {quality:.3f} for {signal['pair']}")
+        enter_position(signal)
+
+def get_enhanced_performance_metrics():
+    """Get enhanced performance metrics using trade history API - LIVE TRADING"""
+    try:
+        # Get recent trades from API
+        recent_trades = get_trades_history(count=100)
+        
+        if not recent_trades:
+            logger.info("No trades available for enhanced metrics")
+            return None
+        
+        # Calculate enhanced metrics
+        total_trades = len(recent_trades)
+        if total_trades == 0:
+            return None
             
-            # Try to enter position
-            enter_position(next_signal)
+        # Get trade balance info
+        trade_balance = get_trade_balance()
+        
+        # Calculate win rate and PnL from API data
+        profitable_trades = 0
+        total_pnl = 0
+        total_fees = 0
+        
+        for trade in recent_trades:
+            # For paper trading, use our database fields
+            if 'net_pnl' in trade:
+                pnl = trade.get('net_pnl', 0)
+                fees = trade.get('fees', 0)
+            else:
+                # For live trading API response
+                pnl = trade.get('cost', 0) - trade.get('fee', 0)
+                fees = trade.get('fee', 0)
+            
+            if pnl > 0:
+                profitable_trades += 1
+            total_pnl += pnl
+            total_fees += fees
+        
+        win_rate = profitable_trades / total_trades if total_trades > 0 else 0
+        avg_pnl_per_trade = total_pnl / total_trades if total_trades > 0 else 0
+        
+        metrics = {
+            'total_trades': total_trades,
+            'win_rate': win_rate,
+            'total_pnl': total_pnl,
+            'total_fees': total_fees,
+            'avg_pnl_per_trade': avg_pnl_per_trade,
+            'net_pnl_after_fees': total_pnl - total_fees
+        }
+        
+        # Add trade balance info if available
+        if trade_balance:
+            metrics.update({
+                'current_equity': trade_balance['equity'],
+                'free_margin': trade_balance['free_margin'],
+                'margin_level': trade_balance['margin_level'],
+                'unrealized_pnl': trade_balance['unrealized_pnl']
+            })
+        
+        logger.info(f"Enhanced Metrics - Trades: {total_trades}, Win Rate: {win_rate*100:.1f}%, "
+                   f"Total PnL: ${total_pnl:.2f}, Net After Fees: ${total_pnl - total_fees:.2f}")
+        
+        return metrics
+        
+    except Exception as e:
+        logger.error(f"Error calculating enhanced performance metrics: {e}")
+        return None
 
 def generate_performance_summary():
     """Generate a performance summary from the database"""
@@ -2962,6 +3647,31 @@ def main(reset_db=False):
     # Setup database with reset option
     setup_database(reset=reset_db)
     
+    # Test API connection and account access
+    try:
+        # Test basic API connectivity
+        server_time = kraken.fetch_status()
+        logger.info(f"✅ Kraken API connection successful. Server status: {server_time}")
+        
+        # Test account access (comment out for paper trading)
+        # ===============================================
+        # UNCOMMENT FOR LIVE TRADING
+        # ===============================================
+        """
+        balance = kraken.fetch_balance()
+        usd_balance = balance.get('ZUSD', {}).get('free', 0)
+        logger.info(f"✅ Account access confirmed. USD Balance: ${usd_balance:.2f}")
+        
+        # Verify we have sufficient balance for trading
+        if usd_balance < initial_capital * 0.1:  # At least 10% of initial capital
+            logger.warning(f"⚠️ Low account balance: ${usd_balance:.2f}")
+        """
+        
+    except Exception as e:
+        logger.error(f"❌ API connection failed: {e}")
+        logger.error("Cannot proceed without API access")
+        return
+    
     # If resetting, set cash to initial_capital
     # In main(), after the check for reset_db=True:
     if reset_db:
@@ -3016,6 +3726,11 @@ def main(reset_db=False):
             
             # Check if the day has changed
             check_day_change()
+            # Check for emergency shutdown signals
+            if check_emergency_signals():
+                logger.critical("🚨 EMERGENCY SHUTDOWN ACTIVATED")
+                emergency_shutdown()
+                break
             
             # Add this line to enforce the position limit
             enforce_position_limit()
@@ -3024,6 +3739,11 @@ def main(reset_db=False):
             is_trading_paused = check_circuit_breakers()
             if is_trading_paused:
                 logger.info(f"Trading is paused until {trading_paused_until}")
+            
+            # Sync positions with exchange (every 10 minutes)
+            if not hasattr(main, 'last_position_sync') or (current_time - main.last_position_sync).total_seconds() >= 600:
+                main.last_position_sync = current_time
+                sync_positions_with_exchange()
             
             # Update equity log (every 5 minutes)
             if not total_equity_history or (current_time - total_equity_history[-1][0]).total_seconds() >= 300:
@@ -3034,6 +3754,30 @@ def main(reset_db=False):
             
             # Process queued signals
             process_signal_queues()
+            
+            # Signal diagnostics every 10 minutes  
+            if not hasattr(main, 'last_diagnostics_time') or (current_time - main.last_diagnostics_time).total_seconds() >= 600:
+                main.last_diagnostics_time = current_time
+                log_signal_diagnostics()
+            
+            # Enhanced monitoring every 5 minutes
+            if not hasattr(main, 'last_enhanced_monitoring') or (current_time - main.last_enhanced_monitoring).total_seconds() >= 300:
+                main.last_enhanced_monitoring = current_time
+        
+                # Get enhanced performance metrics
+                enhanced_metrics = get_enhanced_performance_metrics()
+                if enhanced_metrics:
+                    logger.info(f"📊 Enhanced Performance Summary:")
+                    logger.info(f"   Win Rate: {enhanced_metrics['win_rate']*100:.1f}%")
+                    logger.info(f"   Net PnL: ${enhanced_metrics['net_pnl_after_fees']:.2f}")
+                    if 'margin_level' in enhanced_metrics:
+                        logger.info(f"   Margin Level: {enhanced_metrics['margin_level']:.1f}%")
+                        logger.info(f"   Free Margin: ${enhanced_metrics['free_margin']:.2f}")
+        
+                # Check any pending orders (if we had order IDs to track)
+                open_orders = get_open_orders()
+                if open_orders:
+                    logger.info(f"📋 Open Orders: {len(open_orders)} pending")
             
             # Generate performance summary periodically
             if (current_time - last_summary_time) >= summary_interval:
@@ -3096,6 +3840,12 @@ def main(reset_db=False):
                     logger.info(f"{pair}: {position['side']} @ {position['entry_price']:.4f}, "
                               f"Size: ${position['position_value']:.2f}, Leverage: {position['leverage']}x")
         
+        # === REGIME DETECTION TEST (REMOVE AFTER TESTING) ===
+        logger.info("=== REGIME DETECTION TEST ===")
+        for pair_key in PAIRS.keys():
+            regime = get_cached_regime(pair_key)
+            logger.info(f"{pair_key}: {regime}")
+        logger.info("=== END REGIME TEST ===")
         logger.info("Institutional trading engine shutdown complete")
 
 def print_welcome_message():
@@ -3115,6 +3865,12 @@ def print_welcome_message():
     print(f"Portfolio VaR limit: {MAX_PORTFOLIO_VAR*100:.1f}%")
     print("\nPress Ctrl+C to stop the trading engine")
     print("==================================================\n")
+
+# === TESTING CONFIGURATION ===
+# Temporarily reduce position limits for testing
+if True:  # Set to False for normal operation
+    max_concurrent_trades = 2  # Reduced from 5 for testing
+    logger.info("🧪 TESTING MODE: Reduced max positions to 2")
 
 if __name__ == "__main__":
     print_welcome_message()

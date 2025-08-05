@@ -9,6 +9,7 @@ Features:
 - Hot-swap model deployment without stopping trading engine
 - Comprehensive logging and error handling
 - Rollback mechanism for poor-performing models
+- Data quality checks before training
 """
 
 import os
@@ -373,8 +374,6 @@ class MLPipelineOrchestrator:
         except Exception as e:
             self.logger.error(f"❌ Label update error: {e}")
             return False
-
-    # The following code is unreachable and has been removed to fix indentation errors.
     
     def update_daily_data(self) -> bool:
         """Update daily OHLCV data and features"""
@@ -687,6 +686,106 @@ class MLPipelineOrchestrator:
             self.logger.error(f"Error getting recent performance: {e}")
             return {}
     
+    def run_data_quality_checks(self) -> bool:
+        """Run comprehensive data quality checks before training"""
+        try:
+            self.logger.info("🔍 Running data quality checks...")
+            
+            # Try to import database integrity check module (optional)
+            try:
+                from database_integrity_check import run_database_checks  # type: ignore
+                HAS_DB_INTEGRITY_CHECK = True
+            except ImportError:
+                HAS_DB_INTEGRITY_CHECK = False
+                self.logger.warning("⚠️ database_integrity_check module not found - running basic checks only")
+            
+            if HAS_DB_INTEGRITY_CHECK:
+                # Run comprehensive integrity checks
+                results = run_database_checks(self.db_path)
+                
+                # Log results
+                self.logger.info(f"Database integrity status: {results['overall_status']}")
+                self.logger.info(f"Database size: {results['checks']['database_size_mb']} MB")
+                
+                # Check for critical errors
+                if results['overall_status'] in ['corrupted', 'error']:
+                    self.logger.error("❌ Critical database issues detected:")
+                    for error in results['errors']:
+                        self.logger.error(f"  - {error}")
+                    return False
+                
+                # Log warnings
+                if results['warnings']:
+                    self.logger.warning("⚠️ Data quality warnings:")
+                    for warning in results['warnings']:
+                        self.logger.warning(f"  - {warning}")
+                
+                # Check each pair's data quality
+                all_pairs_healthy = True
+                for pair in self.pairs:
+                    pair_key = f'{pair}_data_quality'
+                    if pair_key in results['checks']:
+                        pair_checks = results['checks'][pair_key]
+                        
+                        if not pair_checks['has_data']:
+                            self.logger.error(f"❌ {pair}: No data found")
+                            all_pairs_healthy = False
+                        elif not pair_checks['has_recent_data']:
+                            self.logger.warning(f"⚠️ {pair}: Data is stale")
+                        elif pair_checks['data_range_days'] < 365:
+                            self.logger.warning(f"⚠️ {pair}: Limited data ({pair_checks['data_range_days']} days)")
+                        else:
+                            self.logger.info(f"✅ {pair}: {pair_checks['row_count']:,} rows, {pair_checks['data_range_days']} days")
+                
+                # Save quality report
+                quality_report_path = self.logs_dir / f"data_quality_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                with open(quality_report_path, 'w') as f:
+                    json.dump(results, f, indent=2)
+                
+                self.logger.info(f"Quality report saved to {quality_report_path}")
+                
+                return all_pairs_healthy and results['overall_status'] != 'corrupted'
+            else:
+                # Basic data quality check without external module
+                self.logger.info("Running basic data quality checks...")
+                
+                try:
+                    conn = sqlite3.connect(self.db_path)
+                    cursor = conn.cursor()
+                    
+                    # Check database accessibility and basic structure
+                    cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
+                    tables = cursor.fetchall()
+                    
+                    if len(tables) == 0:
+                        self.logger.error("❌ No tables found in database")
+                        return False
+                    
+                    self.logger.info(f"✅ Database accessible with {len(tables)} tables")
+                    
+                    # Basic check for each trading pair
+                    for pair in self.pairs:
+                        institutional_table = f"features_{pair.upper()}_1m_institutional"
+                        cursor.execute(f"SELECT COUNT(*) FROM {institutional_table}")
+                        count = cursor.fetchone()[0]
+                        
+                        if count > 0:
+                            self.logger.info(f"✅ {pair}: {count:,} institutional records")
+                        else:
+                            self.logger.warning(f"⚠️ {pair}: No institutional data found")
+                    
+                    conn.close()
+                    self.logger.info("✅ Basic data quality check passed")
+                    return True
+                    
+                except Exception as e:
+                    self.logger.error(f"❌ Basic data quality check failed: {e}")
+                    return False
+            
+        except Exception as e:
+            self.logger.error(f"❌ Data quality check failed: {e}")
+            return False
+    
     def run_weekly_pipeline(self, force_label_update: bool = False, update_data: bool = True) -> bool:
         """Run the complete weekly ML pipeline"""
         pipeline_start = datetime.now()
@@ -701,9 +800,17 @@ class MLPipelineOrchestrator:
         
         try:
             step = 1
-            total_steps = 7 if update_data else 6
+            total_steps = 8 if update_data else 7
             
-            # Step 1: Update daily data (if requested)
+            # Step 1: Data Quality Check
+            print(f"\n[STEP {step}/{total_steps}] 🔍 DATA QUALITY CHECK")
+            print("─" * 50)
+            if not self.run_data_quality_checks():
+                self.logger.error("❌ Data quality checks failed - aborting pipeline")
+                return False
+            step += 1
+            
+            # Step 2: Update daily data (if requested)
             if update_data:
                 print(f"\n[STEP {step}/{total_steps}] 📡 DAILY DATA UPDATE")
                 print("─" * 50)
@@ -712,7 +819,7 @@ class MLPipelineOrchestrator:
                     return False
                 step += 1
             
-            # Step 2: Check data freshness
+            # Step 3: Check data freshness
             print(f"\n[STEP {step}/{total_steps}] 🔍 DATA FRESHNESS CHECK")
             print("─" * 50)
             data_fresh = self.check_data_freshness()
@@ -726,7 +833,7 @@ class MLPipelineOrchestrator:
                 self.logger.info("🔄 Attempting to update institutional labels to resolve staleness...")
                 force_label_update = True
             
-            # Step 3: Update institutional labels (if needed or forced)
+            # Step 4: Update institutional labels (if needed or forced)
             if force_label_update or not data_fresh:
                 print(f"\n[STEP {step}/{total_steps}] 🏷️ INSTITUTIONAL LABELS UPDATE")
                 print("─" * 50)
@@ -747,13 +854,13 @@ class MLPipelineOrchestrator:
                         self.logger.warning("⚠️ Data still appears stale after label update - proceeding anyway")
             step += 1
             
-            # Step 4: Backup current models
+            # Step 5: Backup current models
             print(f"\n[STEP {step}/{total_steps}] 💾 MODEL BACKUP")
             print("─" * 50)
             backup_path = self.backup_current_models()
             step += 1
             
-            # Step 5: Train new models
+            # Step 6: Train new models
             print(f"\n[STEP {step}/{total_steps}] 🤖 MODEL TRAINING")
             print("─" * 50)
             print("⚠️ WARNING: This step typically takes 1-2 hours")
@@ -773,13 +880,13 @@ class MLPipelineOrchestrator:
                 return False
             step += 1
             
-            # Step 6: Validate new models
+            # Step 7: Validate new models
             print(f"\n[STEP {step}/{total_steps}] ✅ MODEL VALIDATION")
             print("─" * 50)
             validation_results = self.validate_new_models()
             step += 1
             
-            # Step 7: Deploy validated models
+            # Step 8: Deploy validated models
             print(f"\n[STEP {step}/{total_steps}] 🚀 MODEL DEPLOYMENT")
             print("─" * 50)
             if not self.deploy_validated_models(validation_results):

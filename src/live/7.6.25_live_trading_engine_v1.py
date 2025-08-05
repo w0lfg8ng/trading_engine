@@ -200,6 +200,30 @@ def setup_database(reset=False):
     conn.commit()
     conn.close()
     logger.info("Database setup complete")
+    # Verify model loading at startup
+    logger.info("🔍 Verifying regime model loading...")
+    models_loaded = 0
+    models_failed = 0
+    
+    for pair_key in PAIRS.keys():
+        for regime in ["range_normal_vol", "range_high_vol", "bull_high_vol", "bear_high_vol"]:
+            try:
+                model, encoder, features = load_regime_model(pair_key, regime)
+                if model is not None:
+                    models_loaded += 1
+                    logger.info(f"✅ Loaded: {pair_key}_{regime}")
+                else:
+                    models_failed += 1
+                    logger.warning(f"❌ Failed: {pair_key}_{regime}")
+            except Exception as e:
+                models_failed += 1
+                logger.error(f"❌ Error loading {pair_key}_{regime}: {e}")
+    
+    logger.info(f"📊 Model Loading Summary: {models_loaded} loaded, {models_failed} failed")
+    
+    if models_failed > models_loaded:
+        logger.critical("🚨 CRITICAL: More models failed than loaded! Check model paths!")
+        return
 
 # === Load API Keys from .env ===
 dotenv.load_dotenv()
@@ -257,11 +281,11 @@ MAX_TOTAL_LEVERAGE = 12  # Maximum portfolio-wide leverage
 TARGET_PORTFOLIO_SHARPE = 2.0  # Target portfolio Sharpe ratio
 
 # Signal quality thresholds
-risk_score_threshold = 0.42  # Increased from 0.35 to be more selective
+risk_score_threshold = 0.60  # Increased from 0.42 to 0.60 (much more selective)
 # Updated constants for better replacement behavior
-MIN_REPLACEMENT_IMPROVEMENT = 1.25  # Increased from 1.10 to 1.25 (25% improvement required)
-MIN_HOLD_TIME_FOR_REPLACEMENT = 30  # Minimum 30 minutes before allowing replacement
-EXCEPTIONAL_SIGNAL_REPLACEMENT_THRESHOLD = 0.95  # Very high confidence needed for quick replacement
+MIN_REPLACEMENT_IMPROVEMENT = 2.0  # Increased from 1.25 t0 2.0 (200% improvement required)
+MIN_HOLD_TIME_FOR_REPLACEMENT = 120  # Increased from 30 to 120 minutes (2 hours minimum)
+EXCEPTIONAL_SIGNAL_REPLACEMENT_THRESHOLD = 0.98  # Increased from 0.95 to 0.98 (nearly perfect signals only)
 EXCEPTIONAL_SIGNAL_THRESHOLD = 0.85  # Threshold for exceptional signals (used in position sizing)
 
 # Pair-specific risk thresholds based on performance
@@ -423,6 +447,11 @@ signal_queues = defaultdict(deque)
 trading_paused_until = None
 partial_exits = {}  # Track positions with partial exits
 signal_quality_history = deque(maxlen=REPLACEMENT_LOOKBACK_WINDOW)  # Recent signal quality history
+
+# Regime caching to avoid frequent database hits
+regime_cache = {}
+last_regime_update = {}
+REGIME_CACHE_MINUTES = 60  # Update regime every 60 minutes
 
 # Global tracking
 current_day = datetime.utcnow().date()
@@ -775,51 +804,130 @@ def calculate_portfolio_var(positions, price_data, correlations=None):
     
     return np.sqrt(portfolio_var)
 
-def detect_market_regime(df_recent, lookback=VOLATILITY_LOOKBACK_WINDOW):
-    """
-    Detect market regime - SAME AS SUCCESSFUL BACKTEST
-    """
-    if len(df_recent) < TREND_WINDOW_DAYS * 24 * 60:  # Not enough data
-        return "range_normal_vol"  # Default regime
+def get_regime_from_pipeline_data(pair_key):
+    """Get current regime using data from the existing pipeline database"""
+    try:
+        # Map pair keys to table names (matching your institutional tables)
+        pair_mapping = {
+            "btcusdt": "XBTUSDT",
+            "ethusdt": "ETHUSDT", 
+            "solusdt": "SOLUSDT",
+            "xrpusdt": "XRPUSDT",
+            "adausdt": "ADAUSDT",
+            "ltcusdt": "LTCUSDT",
+            "dotusdt": "DOTUSDT",
+            "linkusdt": "LINKUSDT",
+            "avaxusdt": "AVAXUSDT",
+        }
+        
+        table_pair = pair_mapping.get(pair_key, pair_key.upper())
+        table_name = f"features_{table_pair}_1m_institutional"
+        
+        # Connect to your main database (not the live trading DB)
+        pipeline_db_path = "/mnt/raid0/data_erick/kraken_trading_model_v2/data/kraken_v2.db"
+        conn = sqlite3.connect(pipeline_db_path)
+        
+        # Get last 60 days of 1-minute data for proper regime detection
+        required_minutes = TREND_WINDOW_DAYS * 24 * 60  # 60 days * 24 hours * 60 minutes
+        
+        query = f"""
+        SELECT timestamp, open, high, low, close, volume 
+        FROM {table_name} 
+        ORDER BY timestamp DESC 
+        LIMIT {required_minutes}
+        """
+        
+        df = pd.read_sql(query, conn)
+        conn.close()
+        
+        if df.empty:
+            logger.warning(f"No pipeline data found for {pair_key} in table {table_name}")
+            return "range_normal_vol"
+        
+        # Convert timestamp if it's in string format
+        if df['timestamp'].dtype == 'object':
+            try:
+                df['timestamp'] = pd.to_datetime(df['timestamp'])
+            except:
+                # If timestamp is unix, convert from unix
+                df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+        
+        # Sort by timestamp (oldest first for regime detection)
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        
+        if len(df) >= VOLATILITY_WINDOW_DAYS * 24 * 60:  # At least 30 days for basic regime detection
+            regime = detect_simplified_regime(df)
+            logger.info(f"Pipeline regime detection for {pair_key}: {regime} (using {len(df)} rows)")
+            return regime
+        else:
+            logger.warning(f"Insufficient pipeline data for {pair_key}: {len(df)} rows, using simplified detection")
+            return detect_simplified_regime(df)
+            
+    except Exception as e:
+        logger.error(f"Error getting regime from pipeline for {pair_key}: {e}")
+        # Fallback to live data with simplified detection
+        try:
+            df = fetch_live_ohlcv(PAIRS[pair_key])
+            if not df.empty:
+                return detect_simplified_regime(df)
+        except:
+            pass
+        return "range_normal_vol"
+
+def detect_simplified_regime(df_recent):
+    """Simplified regime detection when we don't have full 60 days of data"""
+    if len(df_recent) < 1440:  # Less than 1 day
+        return "range_normal_vol"
     
-    df = df_recent.copy()
+    # Use available data for calculations
+    available_days = len(df_recent) / 1440
     
-    # Calculate windows in minutes (assuming 1-minute data)
-    trend_window_minutes = TREND_WINDOW_DAYS * 24 * 60
-    vol_window_minutes = VOLATILITY_WINDOW_DAYS * 24 * 60
+    # Calculate price change over available period  
+    price_change = (df_recent['close'].iloc[-1] / df_recent['close'].iloc[0] - 1)
     
-    # Calculate rolling trend (60-day price change)
-    if len(df) >= trend_window_minutes:
-        price_change_60d = (df['close'].iloc[-1] / df['close'].iloc[-trend_window_minutes] - 1)
-    else:
-        price_change_60d = 0
+    # Annualize the change
+    annualized_change = price_change * (365 / available_days) if available_days > 0 else 0
     
-    # Calculate rolling volatility (30-day)
-    if len(df) >= vol_window_minutes:
-        returns = df['close'].pct_change().dropna()
-        volatility_30d = returns.iloc[-vol_window_minutes:].std() * np.sqrt(1440)  # Daily volatility
-    else:
-        volatility_30d = 0.02  # Default
+    # Calculate volatility over available period
+    returns = df_recent['close'].pct_change().dropna()
+    volatility = returns.std() * np.sqrt(1440)  # Daily volatility
     
-    # Determine trend direction
-    if price_change_60d >= BULL_TREND_THRESHOLD:
+    # Determine trend (using annualized thresholds)
+    if annualized_change >= BULL_TREND_THRESHOLD:
         trend_type = 'bull'
-    elif price_change_60d <= BEAR_TREND_THRESHOLD:
-        trend_type = 'bear'
+    elif annualized_change <= BEAR_TREND_THRESHOLD:
+        trend_type = 'bear'  
     else:
         trend_type = 'range'
     
     # Determine volatility level
-    if volatility_30d >= HIGH_VOLATILITY_THRESHOLD:
+    if volatility >= HIGH_VOLATILITY_THRESHOLD:
         vol_type = 'high_vol'
-    elif volatility_30d <= LOW_VOLATILITY_THRESHOLD:
+    elif volatility <= LOW_VOLATILITY_THRESHOLD:
         vol_type = 'low_vol'
     else:
         vol_type = 'normal_vol'
     
-    # Combine into regime
     regime = f"{trend_type}_{vol_type}"
+    logger.info(f"Simplified regime: {regime} (based on {available_days:.1f} days, vol={volatility:.4f})")
     return regime
+
+def get_cached_regime(pair_key):
+    """Get regime with caching to avoid frequent database hits"""
+    current_time = datetime.utcnow()
+    
+    # Check if we need to update the regime for this pair
+    if (pair_key not in last_regime_update or 
+        (current_time - last_regime_update[pair_key]).total_seconds() > REGIME_CACHE_MINUTES * 60):
+        
+        logger.info(f"Updating cached regime for {pair_key}")
+        regime_cache[pair_key] = get_regime_from_pipeline_data(pair_key)
+        last_regime_update[pair_key] = current_time
+        
+        # Log the regime update
+        logger.info(f"Regime cache updated: {pair_key} -> {regime_cache[pair_key]}")
+    
+    return regime_cache.get(pair_key, "range_normal_vol")
 
 def calculate_risk_adjusted_score(signal, regime):
     """Calculate risk-adjusted score for a signal considering market regime - ENHANCED"""
@@ -828,13 +936,13 @@ def calculate_risk_adjusted_score(signal, regime):
     # Adjust based on market regime
     # Updated regime multipliers to match new regime detection system
     regime_multipliers = {
-        "bull_high_vol": 0.9,       # Bullish but high volatility - slightly cautious
-        "bull_normal_vol": 1.2,     # Ideal trending conditions
-        "bull_low_vol": 1.1,        # Bullish with low volatility
-        "bear_high_vol": 0.7,       # Bearish and volatile - very cautious
-        "bear_normal_vol": 0.8,     # Bearish conditions - cautious
-        "bear_low_vol": 0.9,        # Bearish but stable
-        "range_high_vol": 0.8,      # High volatility sideways - cautious
+        "bull_high_vol": 1.3,       # FIXED: Bull markets should be FAVORABLE, not penalized
+        "bull_normal_vol": 1.4,     # FIXED: Best trending conditions
+        "bull_low_vol": 1.2,        # FIXED: Bullish with low volatility
+        "bear_high_vol": 0.6,       # Bearish and volatile - very cautious
+        "bear_normal_vol": 0.7,     # Bearish conditions - cautious
+        "bear_low_vol": 0.8,        # Bearish but stable
+        "range_high_vol": 0.7,      # High volatility sideways - cautious
         "range_normal_vol": 1.0,    # Normal sideways market
         "range_low_vol": 1.1,       # Low volatility range - slightly favorable
         # Fallback for old regime names
@@ -1015,7 +1123,7 @@ def should_replace_position(new_signal, open_positions, price_data):
         return None
     
     # Calculate new signal quality
-    regime = detect_market_regime(price_data.get(new_signal["pair"], pd.DataFrame()))
+    regime = get_cached_regime(new_signal["pair"])
     new_signal_quality = calculate_risk_adjusted_score(new_signal, regime)
     
     # Don't replace positions unless the new signal is exceptional
@@ -1050,16 +1158,22 @@ def should_replace_position(new_signal, open_positions, price_data):
             else:
                 current_pnl_pct = (entry_price - current_price) / entry_price
             
-            # Don't replace winning positions unless signal is exceptional
-            if current_pnl_pct > 0.01:  # Position is winning more than 1%
-                if new_signal["confidence"] < 0.9:  # Not exceptional signal
-                    continue  # Skip this position - don't replace winning positions
+            # CRITICAL FIX: Strongly protect winning positions
+            if current_pnl_pct > 0.005:  # Position is winning more than 0.5%
+                if new_signal["confidence"] < 0.95:  # Not exceptional signal
+                    continue  # Skip this position - don't replace ANY winning positions
+                # Even for exceptional signals, require massive improvement for winning positions
+                required_improvement = MIN_REPLACEMENT_IMPROVEMENT * 3.0  # 6x improvement needed
                 
         except Exception as e:
             logger.warning(f"Could not calculate PnL for {pair}: {e}")
             current_pnl_pct = 0
         
-        # Don't replace positions that are too new (unless exceptional signal)
+        # ABSOLUTE PROTECTION: Never replace positions less than 1 hour old
+        if held_minutes < 60:  # Absolute minimum 1 hour
+            continue  # Never replace young positions regardless of signal quality
+        
+        # Additional protection for positions less than 2 hours old
         if held_minutes < MIN_HOLD_TIME_FOR_REPLACEMENT:
             if new_signal["confidence"] < EXCEPTIONAL_SIGNAL_REPLACEMENT_THRESHOLD:
                 continue  # Skip this position for replacement
@@ -1165,8 +1279,8 @@ def load_regime_model(pair, regime):
         "adausdt": "ADAUSDT",
         "ltcusdt": "LTCUSDT",
         "dotusdt": "DOTUSDT",
-        "xmrusdt": "XMRUSDT",
-        "dogeusdt": "DOGEUSDT"
+        "linkusdt": "LINKUSDT",    # THIS WAS MISSING!
+        "avaxusdt": "AVAXUSDT",   # THIS WAS MISSING!
     }
     
     model_pair = pair_mapping.get(pair, pair.upper())
@@ -1438,7 +1552,8 @@ def update_price_data(pair_key, df):
     volatility = returns.std() * np.sqrt(1440)  # Convert to daily volatility
     
     # Detect market regime
-    market_regime = detect_market_regime(recent_df)
+    # Use the same regime system as trading decisions
+    market_regime = get_cached_regime(pair_key)
     
     # Store data
     price_data[pair_key] = {
@@ -1496,7 +1611,7 @@ def generate_trading_signal(pair_key, symbol):
             features["future_return"] = 0  # Dummy value
         
         # Detect current market regime FIRST
-        market_regime = detect_market_regime(df)
+        market_regime = get_cached_regime(pair_key)
 
         # Load regime-specific model
         regime_model, regime_encoder, regime_features = load_regime_model(pair_key, market_regime)
@@ -1516,11 +1631,19 @@ def generate_trading_signal(pair_key, symbol):
         # Use regime-specific model
         try:
             # Prepare features for regime model
+            # Prepare features for regime model
             available_features = [col for col in regime_features if col in features.columns]
-    
+            missing_features = [col for col in regime_features if col not in features.columns]
+
             if len(available_features) < len(regime_features) * 0.8:
-                logger.warning(f"Missing too many features for regime {market_regime}, skipping signal")
+                logger.warning(f"Missing too many features for {pair_key} regime {market_regime}")
+                logger.warning(f"Available: {len(available_features)}/{len(regime_features)}")
+                logger.warning(f"Missing features: {missing_features[:10]}...")  # Show first 10
                 return None
+        
+            # Log successful feature matching (only occasionally to avoid spam)
+            if random.random() < 0.01:  # 1% of the time
+                logger.info(f"✅ Feature match for {pair_key}: {len(available_features)}/{len(regime_features)} features available")
     
             # Clean data for prediction
             prediction_data = features[available_features].copy()
@@ -1539,6 +1662,13 @@ def generate_trading_signal(pair_key, symbol):
             prediction = regime_encoder.inverse_transform(regime_predictions)[0]
     
             logger.info(f"Using regime model {pair_key}-{market_regime} with confidence {confidence:.3f}")
+        
+            # Debug signal quality (only log occasionally to avoid spam)
+            if random.random() < 0.1:  # 10% of the time
+                logger.info(f"🔍 Signal Debug for {pair_key}:")
+                logger.info(f"   Prediction: {prediction}, Confidence: {confidence:.3f}")
+                logger.info(f"   Market Regime: {market_regime}")
+                logger.info(f"   Model Features Used: {len(available_features)}")
     
         except Exception as e:
             logger.error(f"Error using regime model: {e}")
@@ -1598,7 +1728,8 @@ def generate_trading_signal(pair_key, symbol):
         score += time_boost
         
         # Get current market regime
-        market_regime = price_data.get(pair_key, {}).get("market_regime", "normal")
+        # Use the regime that was already correctly detected above - don't overwrite it
+        # market_regime is already set from get_cached_regime(pair_key)
         
         # Create features dict for signal
         signal_features = {
@@ -1704,9 +1835,75 @@ def emergency_shutdown():
     except Exception as e:
         logger.critical(f"Error during emergency shutdown: {e}")
 
+def check_emergency_signals():
+    """Check for emergency shutdown signals from dashboard"""
+    # Check for signal file
+    if os.path.exists("EMERGENCY_STOP.signal"):
+        logger.critical("🚨 EMERGENCY STOP signal detected from dashboard!")
+        try:
+            os.remove("EMERGENCY_STOP.signal")
+        except:
+            pass
+        return True
+    
+    # Check database for emergency flags
+    try:
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT COUNT(*) FROM circuit_breakers 
+            WHERE type = 'emergency_shutdown' AND is_active = 1
+        """)
+        emergency_count = cursor.fetchone()[0]
+        conn.close()
+        
+        if emergency_count > 0:
+            logger.critical("🚨 EMERGENCY STOP signal detected in database!")
+            return True
+    except Exception as e:
+        logger.error(f"Error checking emergency signals: {e}")
+    
+    return False
+
+def check_performance_circuit_breaker():
+    """Emergency brake if win rate on replaced trades is too low"""
+    global trading_paused_until
+    
+    # Check recent replaced trade performance
+    conn = sqlite3.connect(DB_FILE)
+    cursor = conn.cursor()
+    
+    # Get last 10 replaced trades
+    cursor.execute("""
+        SELECT COUNT(*), SUM(CASE WHEN net_pnl > 0 THEN 1 ELSE 0 END)
+        FROM trades 
+        WHERE exit_reason = 'replaced' 
+        ORDER BY timestamp DESC 
+        LIMIT 10
+    """)
+    
+    result = cursor.fetchone()
+    conn.close()
+    
+    if result and result[0] >= 5:  # At least 5 recent replaced trades
+        total_replaced = result[0]
+        winning_replaced = result[1] or 0
+        replaced_win_rate = winning_replaced / total_replaced
+        
+        # If win rate on replaced trades is below 20%, pause trading
+        if replaced_win_rate < 0.20:
+            trading_paused_until = datetime.utcnow() + timedelta(hours=2)
+            logger.critical(f"🚨 PERFORMANCE CIRCUIT BREAKER: Replaced trade win rate {replaced_win_rate*100:.1f}% too low. Pausing for 2 hours.")
+            return True
+    
+    return False
+
 def check_circuit_breakers():
     """Check if any circuit breakers should be activated - FIXED VERSION"""
     global trading_paused_until, active_circuit_breakers, daily_stats
+    # Check performance-based circuit breaker first
+    if check_performance_circuit_breaker():
+        return True
     
     current_time = datetime.utcnow()
     
@@ -2012,7 +2209,7 @@ def check_exit_conditions():
                     partial_gross_pnl = 0
     
                 # Cap PnL at a reasonable multiple of position value to prevent cascading issues
-                max_reasonable_pnl = partial_position_value * leverage * 0.10  # Max 10% return per trade
+                max_reasonable_pnl = partial_position_value * leverage * 0.05  # REDUCED from 0.10 to 0.05 (max 5% return per trade)
                 if abs(partial_gross_pnl) > max_reasonable_pnl:
                     logger.warning(f"Partial PnL {partial_gross_pnl} exceeds reasonable limit. Capping at {max_reasonable_pnl}")
                     partial_gross_pnl = np.sign(partial_gross_pnl) * max_reasonable_pnl
@@ -2142,7 +2339,7 @@ def check_exit_conditions():
                     gross_pnl = 0
 
                 # Cap PnL at a reasonable multiple of position value to prevent cascading issues
-                max_reasonable_pnl = position_value * leverage * 0.10  # Max 10% return per trade
+                max_reasonable_pnl = position_value * leverage * 0.05  # REDUCED from 0.10 to 0.05 (max 5% return per trade)
                 if abs(gross_pnl) > max_reasonable_pnl:
                     logger.warning(f"PnL {gross_pnl} exceeds reasonable limit. Capping at {max_reasonable_pnl}")
                     gross_pnl = np.sign(gross_pnl) * max_reasonable_pnl
@@ -3449,6 +3646,11 @@ def main(reset_db=False):
             
             # Check if the day has changed
             check_day_change()
+            # Check for emergency shutdown signals
+            if check_emergency_signals():
+                logger.critical("🚨 EMERGENCY SHUTDOWN ACTIVATED")
+                emergency_shutdown()
+                break
             
             # Add this line to enforce the position limit
             enforce_position_limit()
@@ -3553,6 +3755,12 @@ def main(reset_db=False):
                     logger.info(f"{pair}: {position['side']} @ {position['entry_price']:.4f}, "
                               f"Size: ${position['position_value']:.2f}, Leverage: {position['leverage']}x")
         
+        # === REGIME DETECTION TEST (REMOVE AFTER TESTING) ===
+        logger.info("=== REGIME DETECTION TEST ===")
+        for pair_key in PAIRS.keys():
+            regime = get_cached_regime(pair_key)
+            logger.info(f"{pair_key}: {regime}")
+        logger.info("=== END REGIME TEST ===")
         logger.info("Institutional trading engine shutdown complete")
 
 def print_welcome_message():
