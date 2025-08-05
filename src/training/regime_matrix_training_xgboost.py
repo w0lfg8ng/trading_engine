@@ -45,7 +45,7 @@ PAIRS = [
 ]
 
 # Target label from institutional labeling
-TARGET = "institutional_label_4h"  # Use 4h horizon labels
+TARGET = "institutional_label_12h"  # Use 12h horizon labels (optimal timeframe)
 
 # Model output directory
 MODEL_DIR = "../../models/xgboost_regime_specific/"

@@ -1,8 +1,8 @@
 {
-  "deployment_time": "2025-07-06T06:50:30.879482",
+  "deployment_time": "2025-07-27T06:51:37.215931",
   "total_models": 45,
-  "successful_models": 36,
-  "success_rate": 0.8,
+  "successful_models": 37,
+  "success_rate": 0.8222222222222222,
   "validation_results": {
     "XBTUSDT_bear_high_vol": false,
     "XBTUSDT_bull_high_vol": true,
@@ -11,7 +11,7 @@
     "XBTUSDT_range_normal_vol": true,
     "ETHUSDT_bear_high_vol": true,
     "ETHUSDT_bull_high_vol": true,
-    "ETHUSDT_bull_normal_vol": false,
+    "ETHUSDT_bull_normal_vol": true,
     "ETHUSDT_range_high_vol": true,
     "ETHUSDT_range_normal_vol": true,
     "SOLUSDT_bear_high_vol": true,

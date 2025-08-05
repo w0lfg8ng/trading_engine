@@ -44,6 +44,36 @@ LOW_VOLATILITY_THRESHOLD = 0.015    # 1.5% daily volatility
 BULL_TREND_THRESHOLD = 0.20         # 20% gain over 60 days
 BEAR_TREND_THRESHOLD = -0.20        # -20% loss over 60 days
 
+# === REGIME MODEL LOADING (ADD THIS SECTION HERE) ===
+def load_regime_model_safe(pair, regime, model_dir="models/xgboost_regime_specific/"):
+    """
+    Safely load a regime model with validation
+    Returns None if model is incomplete or missing
+    """
+    model_path = f"{model_dir}/{pair}_{regime}_xgb_model.pkl"
+    encoder_path = f"{model_dir}/{pair}_{regime}_encoder.pkl"
+    features_path = f"{model_dir}/{pair}_{regime}_features.pkl"
+    
+    # Check all 3 files exist
+    if not all(os.path.exists(p) for p in [model_path, encoder_path, features_path]):
+        print(f"⚠️  Missing files for {pair}_{regime}")
+        return None, None, None
+    
+    try:
+        model = joblib.load(model_path)
+        encoder = joblib.load(encoder_path)
+        features = joblib.load(features_path)
+        
+        # Validate loaded objects
+        if model is None or encoder is None or not features:
+            print(f"⚠️  Invalid model data for {pair}_{regime}")
+            return None, None, None
+            
+        return model, encoder, features
+    except Exception as e:
+        print(f"❌ Failed to load {pair}_{regime}: {e}")
+        return None, None, None
+
 def detect_market_regime(df, price_col='close'):
     """
     Detect market regime for each row in the dataframe - SAME AS TRAINING
@@ -133,7 +163,7 @@ def load_regime_model(pair, regime):
         return None, None, None
 
 # === DATABASE AND PAIRS SETTINGS ===
-DB_FILE = "../../data/kraken_v2.db"
+DB_FILE = "data/kraken_v2.db"
 
 # REMOVED MATICUSD - No longer available on Kraken
 PAIRS = [
@@ -829,8 +859,8 @@ def run_backtest_for_pair(pair):
         if len(regime_data) == 0:
             continue
             
-        # Load regime-specific model
-        regime_model, regime_encoder, regime_features = load_regime_model(pair, regime)
+        # NEW: Safe regime-specific model loading
+        regime_model, regime_encoder, regime_features = load_regime_model_safe(pair, regime)
         
         if regime_model is None:
             print(f"  ⚠️ No model available for {pair}-{regime}, using default predictions")
@@ -891,7 +921,7 @@ def run_backtest_for_pair(pair):
     print(f"Confidence range: {df['confidence'].min():.2f} to {df['confidence'].max():.2f}")
     
     # Use institutional labels as target (already calculated during training)
-    target_col = "institutional_label_4h"
+    target_col = "institutional_label_12h"
     if target_col not in df.columns:
         print(f"Warning: {target_col} not found, using backup labeling")
         # Fallback to simple labeling if institutional labels missing
@@ -1651,7 +1681,7 @@ def run_backtest_for_pair(pair):
     df_equity = pd.DataFrame(equity_curve, columns=["timestamp", "equity"])
     
     # Create results directory
-    os.makedirs("../../results/", exist_ok=True)
+    os.makedirs("results/", exist_ok=True)
     
     # Protect against empty equity curve
     if not df_equity.empty and len(df_equity) > 1:
@@ -1667,7 +1697,7 @@ def run_backtest_for_pair(pair):
             plt.plot(df_equity["timestamp"], df_equity["equity"])
             plt.title(f"ENHANCED FIXED Equity Curve - {pair.upper()}")
             plt.grid()
-            plt.savefig(f"../../results/enhanced_fixed_equity_curve_{pair}.png")
+            plt.savefig(f"results/enhanced_fixed_equity_curve_{pair}.png")
             plt.close()
         else:
             print(f"Warning: Insufficient valid data points for equity curve plotting for {pair}")
@@ -1681,7 +1711,7 @@ def run_backtest_for_pair(pair):
     plt.plot(df_equity["timestamp"], drawdown)
     plt.title(f"ENHANCED FIXED Drawdown Curve (%) - {pair.upper()}")
     plt.grid()
-    plt.savefig(f"../../results/enhanced_fixed_drawdown_curve_{pair}.png")
+    plt.savefig(f"results/enhanced_fixed_drawdown_curve_{pair}.png")
     plt.close()
     
     # Calculate performance metrics
@@ -1931,10 +1961,10 @@ def run_backtest_for_pair(pair):
     # Save trade log to CSV
     if trades:
         trades_df = pd.DataFrame(trades)
-        trades_df.to_csv(f"../../results/enhanced_fixed_trades_{pair}.csv", index=False)
+        trades_df.to_csv(f"results/enhanced_fixed_trades_{pair}.csv", index=False)
         
         # Save equity curve to CSV
-        df_equity.to_csv(f"../../results/enhanced_fixed_equity_{pair}.csv", index=False)
+        df_equity.to_csv(f"results/enhanced_fixed_equity_{pair}.csv", index=False)
     
     # Add completion timestamp logging
     end_time_pair = datetime.now()
@@ -2110,7 +2140,7 @@ def exit_reason_analysis(results):
         
         # Get trades for this pair
         pair = result["pair"]
-        trades_file = f"../../results/enhanced_fixed_trades_{pair}.csv"
+        trades_file = f"results/enhanced_fixed_trades_{pair}.csv"
         
         try:
             trades_df = pd.read_csv(trades_file)
@@ -2189,7 +2219,7 @@ if __name__ == "__main__":
         print(cross_pair_df.to_string(index=False))
         
         # Save overall results to CSV
-        cross_pair_df.to_csv("../../results/enhanced_fixed_cross_pair_performance.csv", index=False)
+        cross_pair_df.to_csv("results/enhanced_fixed_cross_pair_performance.csv", index=False)
         
         # Create combined performance chart
         plt.figure(figsize=(14, 8))
@@ -2216,7 +2246,7 @@ if __name__ == "__main__":
             plt.grid(axis="y", alpha=0.3)
             plt.axhline(y=0, color='r', linestyle='-', alpha=0.3)
             plt.tight_layout()
-            plt.savefig("../../results/enhanced_fixed_cross_pair_returns.png")
+            plt.savefig("results/enhanced_fixed_cross_pair_returns.png")
             plt.close()
             
             # Calculate average performance
@@ -2256,7 +2286,7 @@ if __name__ == "__main__":
                 startangle=90, shadow=True)
         plt.axis('equal')  # Equal aspect ratio ensures that pie is drawn as a circle
         plt.title("ENHANCED FIXED Recommended Portfolio Allocation")
-        plt.savefig("../../results/enhanced_fixed_recommended_allocation.png")
+        plt.savefig("results/enhanced_fixed_recommended_allocation.png")
         plt.close()
         
         # 2. Risk Tier Analysis
@@ -2315,7 +2345,7 @@ if __name__ == "__main__":
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
             
-            plt.savefig("../../results/enhanced_fixed_risk_tier_analysis.png")
+            plt.savefig("results/enhanced_fixed_risk_tier_analysis.png")
             plt.close()
         
         # 3. Market Regime Analysis
@@ -2372,7 +2402,7 @@ if __name__ == "__main__":
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
             
-            plt.savefig("../../results/enhanced_fixed_market_regime_analysis.png")
+            plt.savefig("results/enhanced_fixed_market_regime_analysis.png")
             plt.close()
         
         # 4. Exit Reason Analysis
@@ -2429,7 +2459,7 @@ if __name__ == "__main__":
             lines2, labels2 = ax2.get_legend_handles_labels()
             ax1.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
             
-            plt.savefig("../../results/enhanced_fixed_exit_reason_analysis.png")
+            plt.savefig("results/enhanced_fixed_exit_reason_analysis.png")
             plt.close()
     
     end_time = datetime.now()
